@@ -1,137 +1,312 @@
 ```markdown
-# clj-torrent-client
+# clj-torrent-client (Full‑stack на Clojure/ClojureScript)
 
-Учебный BitTorrent-клиент (скачиватель) на **Clojure** (backend/движок) + опционально **ClojureScript** UI. Проект предназначен для демонстрации сетевого взаимодействия, функционального ядра и управления состоянием/конкурентностью в Clojure.
+Учебный проект: **BitTorrent-клиент (скачиватель)** на **Clojure** + **веб‑интерфейс на ClojureScript**.  
+Backend реализует “движок” загрузки (парсинг `.torrent`, общение с трекерами и пирами, запись на диск), frontend — панель управления (добавить торрент, прогресс, пиры, логи).
 
-> Важно: используйте клиент только для контента, на который у вас есть права (например, open-source ISO, public domain, ваши собственные файлы).
+> Важно: используйте приложение только для контента, на который у вас есть права (например, Linux ISO, public domain, собственные файлы).  
 
 ---
 
 ## Содержание
 
+- [Зачем проект](#зачем-проект)
 - [Возможности](#возможности)
-- [Ограничения (что не реализовано)](#ограничения-что-не-реализовано)
-- [Архитектура (как это устроено)](#архитектура-как-это-устроено)
-- [Быстрый старт](#быстрый-старт)
+- [Ограничения](#ограничения)
+- [Архитектура](#архитектура)
+- [Структура репозитория](#структура-репозитория)
+- [Быстрый старт (Dev)](#быстрый-старт-dev)
+- [Сборка (Prod)](#сборка-prod)
+- [Web UI (что есть на фронте)](#web-ui-что-есть-на-фронте)
+- [HTTP API (для фронта)](#http-api-для-фронта)
 - [Конфигурация](#конфигурация)
-- [CLI команды](#cli-команды)
-- [Web UI (опционально)](#web-ui-опционально)
-- [Структура проекта](#структура-проекта)
-- [Протоколы и форматы](#протоколы-и-форматы)
 - [Тестирование](#тестирование)
 - [Roadmap](#roadmap)
-- [Contributing](#contributing)
+- [Правила работы в команде](#правила-работы-в-команде)
+
+---
+
+## Зачем проект
+
+Цель — показать, как на Clojure можно построить прикладную систему с:
+- **чистым функциональным ядром** (piece/state/selection),
+- отделёнными **эффектами** (TCP/HTTP/FS/время),
+- конкурентностью (например, `core.async` или пул потоков),
+- полноценным **front + back** на одном стеке (Clojure + ClojureScript).
 
 ---
 
 ## Возможности
 
-### Реализовано (MVP)
-- Чтение и разбор `.torrent` (bencode decode)
-- Вычисление `info_hash` (SHA1 от `info`-словаря)
-- Общение с **HTTP tracker**:
-  - `announce` (получение списка пиров)
-- Подключение к пирам по TCP и базовая реализация BitTorrent Peer Wire Protocol:
+### Backend (Clojure)
+- Чтение `.torrent` (bencode decode)
+- Вычисление `info_hash` (SHA1 от `info`)
+- HTTP announce к tracker’ам, получение списка пиров
+- TCP соединения к пирам и минимальный Peer Wire Protocol:
   - `handshake`
   - `bitfield`, `have`
-  - `interested`, `unchoke/choke`
+  - `interested`, `choke/unchoke`
   - `request`, `piece`
   - `keep-alive`
-- Загрузка по кускам (pieces/blocks), проверка SHA1 каждого piece
-- Запись на диск (один файл и/или multi-file торренты — зависит от текущей реализации)
-- Простой алгоритм выбора кусков (обычно sequential; может быть улучшен)
+- Загрузка pieces/blocks, проверка SHA1 каждого piece
+- Запись на диск (single-file или multi-file — зависит от текущей реализации)
+- Сессии загрузки: start/stop/pause/resume (если реализовано)
 
-### Опционально / по веткам
-- Web UI (ClojureScript): добавить торрент, смотреть прогресс, список пиров
-- Resume (частичное восстановление прогресса)
-- Ограничение скорости/соединений
-
----
-
-## Ограничения (что не реализовано)
-
-Чтобы проект оставался учебным и реализуемым:
-- Нет DHT (поиск пиров без трекера)
-- Нет UDP-трекеров (только HTTP)
-- Нет uTP, шифрования протокола, PEX
-- Нет полноценного “торрент-менеджера как у больших клиентов” (очереди, приоритеты файлов, тонкие настройки)
+### Frontend (ClojureScript)
+- Добавить торрент (загрузить `.torrent` файлом или указать путь/URL — зависит от реализации)
+- Таблица активных загрузок (progress, скорость, ETA)
+- Страница торрента: список пиров, pieces (опционально), события/логи
+- Управление: pause/resume/stop/remove
 
 ---
 
-## Архитектура (как это устроено)
+## Ограничения
 
-Проект построен по принципу: **чистое ядро + эффектный слой**.
+Чтобы проект оставался учебным и реализуемым, обычно **не делаем**:
+- DHT (поиск пиров без трекера)
+- UDP-трекеры (только HTTP)
+- uTP/PEX/шифрование протокола
+- “как в настоящих клиентах”: сложная очередь, приоритеты файлов, тонкие настройки
+
+---
+
+## Архитектура
+
+Проект организован как **Full-stack монорепо**:
+
+- **Backend** (Clojure):
+  - движок торрента (domain + network + storage)
+  - HTTP API для фронта (`/api/*`)
+  - отдача статики (собранный фронт) из `resources/public`
+
+- **Frontend** (ClojureScript):
+  - SPA, собираемая `shadow-cljs`
+  - общается с backend через JSON API
 
 ### Поток данных (упрощённо)
 
-1. `metainfo` читает `.torrent`, парсит `info`, вычисляет `info_hash`, формирует модель раздачи.
-2. `tracker` делает HTTP announce → получает список пиров.
-3. `peer`-слой открывает TCP соединения к пирам, делает handshake, выясняет доступные pieces.
-4. `piece`-слой выбирает следующий piece/block для скачивания.
-5. `storage` принимает полученные blocks, собирает pieces, проверяет SHA1, пишет на диск.
-6. `session` координирует всё: состояние, конкуренцию, перезапуски, метрики.
+1) Пользователь добавляет `.torrent` в UI  
+2) Backend парсит metainfo, вычисляет `info_hash`  
+3) Backend делает `announce` к HTTP tracker’ам → получает peers  
+4) Backend открывает TCP соединения к пирам → скачивает blocks → собирает pieces  
+5) `storage` пишет на диск, `verify` проверяет SHA1  
+6) UI периодически опрашивает `/api/...` и показывает прогресс
 
-### Ключевые компоненты
+### Принцип “чистое ядро + эффекты”
 
-- **Domain (чистая логика)**  
-  - выбор следующего блока/куска
-  - обновление состояния “какие pieces есть/нужны”
+- **Чистые функции (domain)**:
+  - piece/block state transitions
+  - piece selection (выбор следующего блока)
   - расчёт прогресса
-- **Effects**  
-  - HTTP запросы к трекеру  
-  - TCP сокеты к пирам  
-  - файловая система  
-  - время, логирование
-
-### Конкурентность
-Обычно используется один из подходов:
-- `core.async` (каналы: события сети → обработка → команды записи/запроса)
-- или `future`/thread pools + очереди сообщений
-
-В README ниже команды и примеры не завязаны на конкретную реализацию, но структура модулей — да.
+- **Эффекты**:
+  - HTTP к трекеру
+  - TCP к пирам
+  - файловая система
+  - время/логирование
 
 ---
 
-## Быстрый старт
+## Структура репозитория
+
+Рекомендуемая раскладка (может немного отличаться от фактической, но держим близко):
+
+```
+deps.edn
+shadow-cljs.edn
+src/
+  torrent/
+    codec/
+      bencode.clj
+    metainfo.clj
+    tracker/http.clj
+    peer/
+      wire.clj
+      conn.clj
+    pieces/
+      state.clj
+      selection.clj
+    storage/
+      files.clj
+      verify.clj
+    session.clj
+    http_api.clj
+    server.clj
+resources/
+  public/                 ; прод-сборка фронта (index.html, js)
+frontend/
+  src/
+    app/
+      core.cljs
+      events.cljs         ; если re-frame
+      subs.cljs
+      views.cljs
+test/
+  torrent/...
+```
+
+---
+
+## Быстрый старт (Dev)
 
 ### Требования
-- JDK 21+ (или 17+, если проект настроен на него)
+- JDK 17+ (или 21+)
 - Clojure CLI (`clj`)
-- (Опционально для UI) Node.js + `shadow-cljs`
+- Node.js (для сборки фронта)
+- `npx` (обычно идёт с Node)
 
-### Клонирование
+### 1) Установка зависимостей фронта (если используются npm deps)
+Если `shadow-cljs` тянет npm-пакеты:
 ```bash
-git clone https://github.com/<org-or-user>/clj-torrent-client.git
-cd clj-torrent-client
+npm install
 ```
 
-### Запуск тестов
+### 2) Запуск backend (API + статика)
 ```bash
-clj -M:test
+clj -M:dev
 ```
 
-### Скачивание (пример)
-Используйте `.torrent`, который распространяется легально или создан вами.
+Ожидаем:
+- API доступно на `http://localhost:8080`
+- (опционально) health: `GET /api/health`
+
+### 3) Запуск frontend в watch режиме
 ```bash
-clj -M:run -- download \
-  --torrent ./examples/sample.torrent \
-  --out ./downloads
+npx shadow-cljs watch app
 ```
 
-После запуска приложение:
-- прочитает metainfo,
-- запросит peers у HTTP-трекера(ов),
-- начнёт подключаться к пирам и скачивать pieces,
-- будет писать прогресс в консоль (и/или отдавать через API для UI).
+Обычно UI доступен на:
+- `http://localhost:3000` (dev server shadow)
+- а API — на `http://localhost:8080`
+
+> Примечание: в dev режиме могут понадобиться CORS настройки на backend или прокси в shadow dev server.
+
+---
+
+## Сборка (Prod)
+
+### 1) Собрать фронт в `resources/public`
+```bash
+npx shadow-cljs release app
+```
+
+### 2) Запустить backend (который раздаёт статику)
+```bash
+clj -M:run
+```
+
+Открыть:
+- `http://localhost:8080/` — SPA
+- `http://localhost:8080/api/...` — API
+
+---
+
+## Web UI (что есть на фронте)
+
+### Страницы/экраны (минимальный набор)
+1) **Dashboard / Torrents**
+- список активных торрентов:
+  - имя
+  - прогресс (%)
+  - скачано/всего
+  - скорость down/up (если есть)
+  - статус (running/paused/stopped/finished)
+- действия: pause/resume/stop/remove
+
+2) **Add Torrent**
+- загрузить `.torrent` файлом (рекомендуется для учебного UX)
+- или указать путь на сервере (если проект так устроен)
+- после добавления — редирект на details
+
+3) **Torrent Details**
+- метаданные (name, size, pieces count, piece length)
+- список peers (ip:port, choked/unchoked, last-seen)
+- логи событий (tracker announce, peer connect, verify ok/fail)
+
+### Технологии фронта (предлагаемо)
+- `reagent` (+ опционально `re-frame`)
+- HTTP запросы через `fetch`/`cljs-ajax`
+- роутинг опционально (`reitit-frontend`)
+
+---
+
+## HTTP API (для фронта)
+
+Ниже пример API, которое должен предоставлять backend. Форматы — JSON.
+
+### Health
+`GET /api/health`
+```json
+{"status":"ok"}
+```
+
+### Создать сессию загрузки
+`POST /api/torrents`
+
+Вариант A (upload `.torrent` файлом): `multipart/form-data`  
+- field: `file`
+
+Вариант B (простой учебный): JSON
+```json
+{"torrentPath":"./examples/sample.torrent","outDir":"./downloads"}
+```
+
+Ответ:
+```json
+{"id":"<uuid>","name":"...","status":"running"}
+```
+
+### Список сессий
+`GET /api/torrents`
+```json
+[
+  {"id":"...","name":"...","progress":0.42,"status":"running","downSpeed":123456}
+]
+```
+
+### Детали по сессии
+`GET /api/torrents/:id`
+```json
+{
+  "id":"...",
+  "name":"...",
+  "status":"running",
+  "totalBytes":123,
+  "downloadedBytes":45,
+  "progress":0.36,
+  "piecesTotal":1000,
+  "piecesDone":360,
+  "peers":{"connected":12,"active":8}
+}
+```
+
+### Пиры
+`GET /api/torrents/:id/peers`
+```json
+[
+  {"ip":"1.2.3.4","port":51413,"choked":false,"lastSeen":1730000000}
+]
+```
+
+### Управление
+- `POST /api/torrents/:id/pause`
+- `POST /api/torrents/:id/resume`
+- `POST /api/torrents/:id/stop`
+- `DELETE /api/torrents/:id`
+
+Ответ везде — актуальный статус или `{ok:true}`.
+
+> Важно: API не должно “сливать” приватные данные. Для учебного проекта достаточно без авторизации, но можно добавить простой токен на админку.
 
 ---
 
 ## Конфигурация
 
-Конфиг читается из EDN (пример: `config/dev.edn`):
+Конфиг хранится в EDN (пример `config/dev.edn`):
 
 ```edn
-{:client {:peer-id-prefix "-CLJ001-"
+{:http {:port 8080}
+
+ :client {:peer-id-prefix "-CLJ001-"
           :port 51413
           :max-peers 40
           :numwant 50
@@ -146,127 +321,6 @@ clj -M:run -- download \
  :logging {:level :info}}
 ```
 
-Переопределение:
-- через аргументы CLI
-- или переменную окружения (если добавлено): `CLJ_TORRENT_CONFIG=...`
-
----
-
-## CLI команды
-
-> Точные команды зависят от того, как оформлен `-main`. Ниже рекомендуемый интерфейс.
-
-### `download`
-Скачать раздачу из `.torrent` в указанную папку.
-```bash
-clj -M:run -- download --torrent path/to/file.torrent --out ./downloads
-```
-
-Опции:
-- `--max-peers N` — лимит активных соединений
-- `--port P` — локальный порт (если требуется)
-- `--log-level debug|info|warn`
-
-### `inspect`
-Показать информацию о торренте без скачивания:
-```bash
-clj -M:run -- inspect --torrent path/to/file.torrent
-```
-
-Вывод:
-- name, total size
-- piece length, pieces count
-- announce / announce-list
-
-### `seed` (если реализовано)
-Раздавать файл(ы), соответствующие торренту:
-```bash
-clj -M:run -- seed --torrent path/to/file.torrent --data ./downloads
-```
-
----
-
-## Web UI (опционально)
-
-Если в проекте есть UI, обычно это выглядит так:
-
-### Dev режим
-1) Запустить backend API:
-```bash
-clj -M:run -- api --port 8080
-```
-
-2) Запустить фронт:
-```bash
-npx shadow-cljs watch app
-```
-
-Открыть:
-- UI: `http://localhost:3000`
-- API: `http://localhost:8080/api/*`
-
-### Пример API (типично)
-- `GET /api/torrents` — список активных сессий
-- `POST /api/torrents` `{torrentPath|torrentBytes}` — добавить торрент
-- `GET /api/torrents/:id` — прогресс/скорость/пиры
-- `POST /api/torrents/:id/pause|resume|stop`
-
----
-
-## Структура проекта
-
-Примерная раскладка:
-
-```
-src/
-  torrent/codec/
-    bencode.clj            ; bencode decode/encode
-  torrent/metainfo.clj     ; parse .torrent, info_hash
-  torrent/tracker/http.clj ; announce к HTTP tracker
-  torrent/peer/
-    wire.clj               ; кодирование/декодирование peer messages
-    conn.clj               ; TCP соединение, handshake, чтение/запись
-  torrent/pieces/
-    selection.clj          ; выбор piece/block
-    state.clj              ; состояние pieces/blocks
-  torrent/storage/
-    files.clj              ; mapping piece->file offsets, запись
-    verify.clj             ; SHA1 verify
-  torrent/session.clj      ; оркестрация, жизненный цикл
-  torrent/cli.clj          ; CLI entrypoints
-  torrent/http_api.clj     ; (опц) REST для UI
-resources/
-  public/                  ; (опц) собранный фронт
-examples/
-  sample.torrent           ; пример для тестов/демо (легальный контент/заглушка)
-test/
-  torrent/...
-```
-
----
-
-## Протоколы и форматы
-
-### `.torrent` (metainfo)
-- bencode словарь
-- ключевой словарь `info`:
-  - `piece length`
-  - `pieces` (concatenated SHA1 hashes)
-  - `name`
-  - `length` или `files` (для multi-file)
-
-`info_hash` = `SHA1(bencode(info))`
-
-### Tracker (HTTP)
-Поддерживается:
-- `announce` запросы к URL из `announce`/`announce-list`
-- разбор bencode ответа
-- обработка `peers` (обычный или compact — зависит от реализации)
-
-### Peer Wire Protocol
-Минимально необходимые сообщения для скачивания:
-- handshake → interested → unchoke → request/piece цикл
-
 ---
 
 ## Тестирование
@@ -276,42 +330,44 @@ test/
 clj -M:test
 ```
 
-Рекомендуемые группы тестов:
-- `bencode` encode/decode
-- `metainfo` вычисление info_hash (фиксированные fixtures)
-- piece hashing/verification
-- выбор кусков (selection) как чистые функции
-- (интеграционные) имитация peer wire на локальном “fake peer” (если есть)
+Что тестируем обязательно:
+- `bencode` encode/decode (fixtures)
+- вычисление `info_hash` на фиксированном `.torrent`
+- `verify` (SHA1 для piece)
+- domain state transitions (pieces/blocks)
+- selection алгоритм как чистые функции
+
+Интеграционные тесты (по возможности):
+- поднять “fake peer” локально и прогнать handshake + одно скачивание блока
+- тест API (`/api/torrents`, `/api/torrents/:id`)
 
 ---
 
 ## Roadmap
 
-Ближайшие улучшения:
-- Поддержка compact peers полностью (если ещё нет)
-- Улучшенный piece selection (rarest-first)
-- “Endgame mode” (дублирование последних запросов)
-- Resume: хранить bitfield/прогресс на диск
-- Ограничение скорости (token bucket)
-- UDP trackers / DHT (как отдельные расширения, если хватит времени)
+Короткий список улучшений (по приоритету):
+1) Более устойчивый networking (таймауты, reconnect, лимиты)
+2) Поддержка compact peers от tracker’ов полностью
+3) Rarest-first selection (или хотя бы “random-first” после старта)
+4) Resume (сохранить bitfield/прогресс на диск)
+5) Ограничение скорости (token bucket)
+6) UDP trackers / DHT (отдельный advanced этап)
 
 ---
 
-## Contributing
+## Правила работы в команде
 
-1) Создайте ветку `feature/<name>`
-2) Пишите тесты на доменную логику (selection/state/verify)
-3) Отделяйте чистые функции от IO (сеть/файлы/время)
-4) PR должен включать:
-   - краткое описание
-   - как протестировать
-   - ограничения/побочные эффекты
+- **Доменная логика** (selection/state/verify) — по возможности **чистые функции** + покрытие тестами.
+- Сеть/FS — отдельные неймспейсы, минимум логики внутри side-effect кода.
+- PR должен содержать:
+  - описание изменений
+  - как запустить/проверить
+  - тесты или объяснение, почему тесты не добавлены
+- Имена веток: `feature/...`, `fix/...`, `refactor/...`
 
 ---
 
 ## Лицензия
 
-MIT (или другая, укажите здесь).
+Укажите выбранную лицензию (например MIT) в `LICENSE`.
 ```
-
-Если скажешь, какие у вас уже есть решения по стеку (core.async или futures, нужен ли Web UI, один торрент за раз или несколько), я подгоню README под ваш фактический `deps.edn`, алиасы (`:run`, `:test`) и реальные команды запуска.
