@@ -1,0 +1,8 @@
+{:source-paths ["frontend/src"]
+ :builds
+ {:app {:target :browser
+        :output-dir "resources/public/js"
+        :asset-path "/js"
+        :modules {:main {:init-fn ui.core/init}}
+        :devtools {:http-root "frontend/public"
+                   :http-port 3000}}}}

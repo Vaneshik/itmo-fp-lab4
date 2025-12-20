@@ -1,0 +1,9 @@
+{:paths ["src" "resources"]
+ :deps  {}
+ :aliases
+ {:dev  {:extra-paths ["dev" "test" "config"]
+         :main-opts ["-m" "app.main" "dev"]}
+  :run  {:extra-paths ["config"]
+         :main-opts ["-m" "app.main" "run"]}
+  :test {:extra-paths ["test" "config"]
+         :main-opts ["-m" "clojure.test" ]}}}
