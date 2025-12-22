@@ -1,0 +1,7 @@
+{:http {:port 8080}
+
+ :client {:peer-id-prefix "-CLJ001-"
+          :port 51413
+          :numwant 50}
+
+ :timeouts {:tracker-ms 7000}}

@@ -1,4 +1,3 @@
-```markdown
 # clj-torrent-client (Full‑stack на Clojure/ClojureScript)
 
 Учебный проект: **BitTorrent-клиент (скачиватель)** на **Clojure** + **веб‑интерфейс на ClojureScript**.  
