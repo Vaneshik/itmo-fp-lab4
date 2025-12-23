@@ -8,8 +8,6 @@
            [java.util Arrays]))
 
 (def block-size 16384)
-
-;; сколько request'ов держим "в полёте" на один piece
 (def pipeline-depth 12)
 
 (defn now-ms [] (System/currentTimeMillis))
@@ -142,8 +140,9 @@
 (defn- download-piece-pipelined!
   "Download piece using request pipelining.
    Returns true if verified OK.
+   handle-extended! вызывается на extended-сообщениях (PEX).
    May throw ExceptionInfo with {:reason :choked} to signal 'not fatal, just retry later'."
-  [^RandomAccessFile raf in out stats torrent state piece-idx]
+  [^RandomAccessFile raf in out stats torrent state handle-extended! piece-idx]
   (let [pieces-count (:pieces-count state)
         plen (piece-len (:length torrent) (:piece-length torrent) piece-idx pieces-count)
         blocks (blocks-for-piece plen)
@@ -162,11 +161,10 @@
                     (pw/send-msg! out 6 (pw/build-request-payload piece-idx b l))
                     (swap! next-send inc)
                     true)))]
-        ;; initial fill
+
         (dotimes [_ (min pipeline-depth total)]
           (send-next!))
 
-        ;; receive loop
         (loop [remaining total timeouts 0]
           (when (pos? remaining)
             (let [{:keys [timeout eof keep-alive id payload]} (pw/read-msg! in)]
@@ -188,6 +186,11 @@
                 :else
                 (let [t (pw/msg-type id)]
                   (cond
+                    (= t :extended)
+                    (do
+                      (handle-extended! payload)
+                      (recur remaining timeouts))
+
                     (= t :choke)
                     (do
                       (handle-msg! state id payload)
@@ -204,7 +207,7 @@
                           (write-block! raf piece-idx (:piece-length torrent) b block)
                           (swap! (:downloaded stats) + (alength ^bytes block))
                           (swap! pending disj b)
-                          (send-next!) ;; keep pipeline full
+                          (send-next!)
                           (recur (dec remaining) 0))
                         (recur remaining timeouts)))
 
@@ -213,14 +216,13 @@
                       (handle-msg! state id payload)
                       (recur remaining timeouts))))))))
 
-        ;; verify sha1
         (let [piece-bytes (read-piece-bytes raf piece-idx (:piece-length torrent) plen)
               got (bx/sha1 piece-bytes)
               expected (nth (:piece-hashes torrent) piece-idx)]
           (Arrays/equals ^bytes got ^bytes expected))))))
 
 (defn worker!
-  [{:keys [peer torrent peer-id stats queue done]}]
+  [{:keys [peer torrent peer-id stats queue done peers-pool port]}]
   (let [current-piece (atom nil)]
     (try
       (with-open [sock (pw/connect peer 8000 60000)
@@ -238,6 +240,9 @@
           (when-not (Arrays/equals ^bytes info-hash ^bytes (:info-hash torrent))
             (throw (ex-info "Wrong info_hash" {}))))
 
+        ;; BEP-10: extended handshake (ut_pex)
+        (pw/send-ext-handshake! out (long port))
+
         ;; interested
         (pw/send-msg! out 2 (byte-array 0))
 
@@ -248,7 +253,26 @@
               state {:pieces-count pieces-count
                      :have have
                      :have-known? have-known?
-                     :choked? choked?}]
+                     :choked? choked?}
+
+              ut-pex-id (atom nil)
+
+              handle-extended!
+              (fn [^bytes payload]
+                (let [{:keys [ext-id data]} (pw/parse-extended payload)]
+                  (cond
+                    (= ext-id 0)
+                    (let [{id :ut-pex-id} (pw/parse-ext-handshake data)]
+                      (when id
+                        (reset! ut-pex-id id)))
+
+                    (and @ut-pex-id (= ext-id @ut-pex-id))
+                    (let [{:keys [added]} (pw/parse-ut-pex data)]
+                      (when (seq added)
+                        ;; кидаем найденных пиров в общий пул
+                        (swap! peers-pool into added)))
+
+                    :else nil)))]
 
           (loop []
             (when-not @done
@@ -263,7 +287,7 @@
                       (when-let [piece-idx (pick-piece! queue have)]
                         (reset! current-piece piece-idx)
                         (try
-                          (let [ok? (download-piece-pipelined! raf in out stats torrent state piece-idx)]
+                          (let [ok? (download-piece-pipelined! raf in out stats torrent state handle-extended! piece-idx)]
                             (if ok?
                               (swap! (:pieces-done stats) inc)
                               (swap! queue conj piece-idx)))
@@ -283,13 +307,16 @@
 
                   :else
                   (do
+                    (when (= (pw/msg-type id) :extended)
+                      (handle-extended! payload))
+
                     (handle-msg! state id payload)
 
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
                       (when-let [piece-idx (pick-piece! queue have)]
                         (reset! current-piece piece-idx)
                         (try
-                          (let [ok? (download-piece-pipelined! raf in out stats torrent state piece-idx)]
+                          (let [ok? (download-piece-pipelined! raf in out stats torrent state handle-extended! piece-idx)]
                             (if ok?
                               (swap! (:pieces-done stats) inc)
                               (swap! queue conj piece-idx)))
@@ -321,8 +348,7 @@
         (swap! (:peers-active stats) (fn [x] (max 0 (dec x))))))))
 
 (defn peer-manager!
-  "Держит target активных воркеров. Уважает tracker interval (не спамит).
-   Ранний re-announce делаем только если совсем нет пиров."
+  "Держит target активных воркеров."
   [{:keys [torrent peer-id port stats queue done]} target]
   (let [peers-pool (atom [])
         started?   (atom false)
@@ -339,31 +365,61 @@
 
           (when (and pool-empty? (or due? early?))
             (try
-              (let [resp (tr/announce {:announce   (:announce torrent)
-                                       :info-hash  (:info-hash torrent)
-                                       :peer-id    peer-id
-                                       :port       port
-                                       :uploaded   0
-                                       :downloaded @(:downloaded stats)
-                                       :left       (max 0 (- (:length torrent) @(:downloaded stats)))
-                                       :numwant    120
-                                       :event      (when (compare-and-set! started? false true) :started)})
-                    interval (long (max 30 (or (:interval resp) 120)))
-                    peers (:peers resp)
+              (let [extra-trackers
+                    ["udp://tracker.opentrackr.org:1337/announce"
+                     "udp://open.stealth.si:80/announce"
+                     "udp://open.demonii.com:1337/announce"
+                     "udp://tracker.torrent.eu.org:451/announce"
+                     "udp://tracker.dler.org:6969/announce"]
+                    trackers (vec (distinct (concat (or (:announce-list torrent) [(:announce torrent)])
+                                                    extra-trackers)))
+                    event* (when (compare-and-set! started? false true) :started)
+
+                    results
+                    (map (fn [url]
+                           (try
+                             {:url url :ok true
+                              :resp (tr/announce {:announce   url
+                                                  :info-hash  (:info-hash torrent)
+                                                  :peer-id    peer-id
+                                                  :port       port
+                                                  :uploaded   0
+                                                  :downloaded @(:downloaded stats)
+                                                  :left       (max 0 (- (:length torrent) @(:downloaded stats)))
+                                                  :numwant    400
+                                                  :event      event*})}
+                             (catch Exception e
+                               (println "\n[tracker] failed:" url "|" (.getMessage e)
+                                        (when (ex-data e) (str "| data=" (pr-str (ex-data e)))))
+                               {:url url :ok false :err e})))
+                         trackers)
+
+                    good (filter :ok results)
+                    peers (->> good (mapcat (comp :peers :resp)) vec)
+                    interval (long (max 30 (or (some->> good (map (comp :interval :resp)) (remove nil?) (apply min))
+                                               120)))
+
                     peers2 (->> peers
                                 (remove #(peer-bad? stats %))
                                 (remove @in-flight)
+                                distinct
                                 vec)]
+
                 (reset! last-announce-ms now)
                 (reset! next-announce-ms (+ now (* interval 1000)))
 
-                (println (format "\n[tracker] peers raw=%d fresh=%d interval=%ds"
-                                 (count peers) (count peers2) interval))
+                (let [pool-before (count @peers-pool)]
+                  (println (format
+                            "\n[tracker] trackers=%d ok=%d raw=%d fresh=%d pool(before)=%d active=%d interval=%ds"
+                            (count trackers) (count good) (count peers) (count peers2)
+                            pool-before @(:peers-active stats) interval)))
 
                 (when (seq peers2)
-                  (swap! peers-pool into peers2)))
+                  (swap! peers-pool into peers2))
+                (println (format "[tracker] pool(after)=%d" (count @peers-pool))))
               (catch Exception e
-                (println "\n[tracker] announce failed:" (.getMessage e))
+                (println "\n[tracker] announce failed:" (.getMessage e)
+                         (when (ex-data e) (str " | data=" (pr-str (ex-data e)))))
                 (reset! next-announce-ms (+ now 15000))))))
 
         ;; запускаем воркеры
@@ -375,12 +431,17 @@
             (when (and (not (peer-bad? stats p))
                        (not (contains? @in-flight p)))
               (swap! in-flight conj p)
+              (println (format "[manager] starting worker for %s (active=%d pool=%d)"
+                               (peer-key p) @(:peers-active stats) (count @peers-pool)))
               (future
                 (try
                   (worker! {:peer p :torrent torrent :peer-id peer-id
-                            :stats stats :queue queue :done done})
+                            :stats stats :queue queue :done done
+                            :peers-pool peers-pool :port port})
                   (finally
-                    (swap! in-flight disj p)))))))
+                    (swap! in-flight disj p)
+                    (println (format "[manager] worker finished for %s (active=%d)"
+                                     (peer-key p) @(:peers-active stats)))))))))
 
         (Thread/sleep 200)))))
 
@@ -413,6 +474,7 @@
       (println "size    :" (:length t) "bytes")
       (println "pieces  :" pieces-total)
       (println "infohash:" (:info-hash-hex t))
+      (println "trackers:" (or (:announce-list t) [(:announce t)]))
 
       (start-stats-printer! stats (:length t) pieces-total done)
 

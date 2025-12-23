@@ -5,7 +5,7 @@
   ;; JVM class for byte[]
   (Class/forName "[B"))
 
-(defn bytes?
+(defn byte-array?
   "True если x — byte[] (массив примитивных байтов)."
   [x]
   (instance? byte-array-class x))

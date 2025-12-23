@@ -1,6 +1,10 @@
 (ns mini-torrent.peer
-  (:import [java.net Socket InetSocketAddress SocketTimeoutException]
-           [java.io DataInputStream DataOutputStream EOFException]))
+  (:require [mini-torrent.bencode :as ben]
+            [mini-torrent.bytes :as bx])
+  (:import [java.net Socket InetSocketAddress SocketTimeoutException InetAddress]
+           [java.io DataInputStream DataOutputStream EOFException ByteArrayOutputStream]))
+
+;; --- io helpers -------------------------------------------------------------
 
 (defn- write-int! [^DataOutputStream out ^long v]
   (.writeInt out (int v)))
@@ -36,19 +40,22 @@
                   (bit-shift-left b2 8)
                   b3))))
 
+;; --- protocol ---------------------------------------------------------------
+
 (defn msg-type
   "Преобразует numeric msg id в keyword."
   [^long id]
   (case (long id)
-    0 :choke
-    1 :unchoke
-    2 :interested
-    3 :not-interested
-    4 :have
-    5 :bitfield
-    6 :request
-    7 :piece
-    8 :cancel
+    0  :choke
+    1  :unchoke
+    2  :interested
+    3  :not-interested
+    4  :have
+    5  :bitfield
+    6  :request
+    7  :piece
+    8  :cancel
+    20 :extended
     :unknown))
 
 (defn connect
@@ -65,10 +72,14 @@
      sock)))
 
 (defn send-handshake!
+  "BitTorrent handshake. Ставим флаг Extension Protocol (BEP-10) в reserved bytes."
   [^DataOutputStream out ^bytes info-hash ^bytes peer-id]
   (.writeByte out 19)
   (.write out (.getBytes "BitTorrent protocol"))
-  (.write out (byte-array 8)) ;; reserved
+  (let [reserved (byte-array 8)]
+    ;; BEP-10: reserved[5] bit 0x10
+    (aset-byte reserved 5 (unchecked-byte 0x10))
+    (.write out reserved))
   (.write out info-hash)
   (.write out peer-id)
   (.flush out))
@@ -77,10 +88,10 @@
   [^DataInputStream in]
   (let [pstrlen (.readUnsignedByte in)
         pstr (String. (read-n! in pstrlen))
-        _reserved (read-n! in 8)
+        reserved (read-n! in 8)
         info-hash (read-n! in 20)
         peer-id (read-n! in 20)]
-    {:pstr pstr :info-hash info-hash :peer-id peer-id}))
+    {:pstr pstr :reserved reserved :info-hash info-hash :peer-id peer-id}))
 
 (defn send-msg!
   "Отправляет message: <len:4><id:1><payload:len-1>."
@@ -98,11 +109,9 @@
 
 (defn read-msg!
   "Читает length-prefixed сообщение.
-   Возвращает одну из форм:
-   {:timeout true}
-   {:eof true}
-   {:keep-alive true}
-   {:id <long> :payload <bytes>}  ;; payload включает первый байт id."
+   Возвращает:
+   {:timeout true} | {:eof true} | {:keep-alive true} | {:id <long> :payload <bytes>}
+   payload включает первый байт id."
   [^DataInputStream in]
   (try
     (let [len (read-int! in)]
@@ -128,12 +137,12 @@
     (aset-int32-be! 8 length)))
 
 (defn parse-have-index
-  "payload (включая id в payload[0]) -> index."
+  "payload (включая id) -> index."
   [^bytes payload]
   (int32-be payload 1))
 
 (defn parse-piece
-  "payload (включая id в payload[0]) -> {:index .. :begin .. :block byte[]}."
+  "payload (включая id) -> {:index .. :begin .. :block byte[]}."
   [^bytes payload]
   (let [idx (int32-be payload 1)
         begin (int32-be payload 5)
@@ -159,3 +168,115 @@
                           (pos? (bit-and (u8 (aget bf byte-idx))
                                          (bit-shift-left 1 bit-idx)))))))
       have)))
+
+;; --- BEP-10 / ut_pex --------------------------------------------------------
+
+(defn parse-extended
+  "payload (включая id=20 в payload[0]) -> {:ext-id <int> :data <bytes>}"
+  [^bytes payload]
+  (let [ext-id (u8 (aget payload 1))
+        n (- (alength payload) 2)
+        data (byte-array (max 0 n))]
+    (when (pos? n)
+      (System/arraycopy payload 2 data 0 n))
+    {:ext-id ext-id :data data}))
+
+(defn send-extended!
+  "Отправляет extended message (id=20): payload = <ext-id:1><data...>."
+  [^DataOutputStream out ^long ext-id ^bytes data]
+  (let [p (byte-array (+ 1 (alength data)))]
+    (aset-byte p 0 (unchecked-byte (bit-and (long ext-id) 0xff)))
+    (when (pos? (alength data))
+      (System/arraycopy data 0 p 1 (alength data)))
+    (send-msg! out 20 p)))
+
+;; --- tiny bencode encoder for ext handshake --------------------------------
+
+(defn- baos-write-str! ^ByteArrayOutputStream [^ByteArrayOutputStream baos ^String s]
+  (let [bs (.getBytes s "UTF-8")]
+    (.write baos (.getBytes (str (alength bs) ":") "UTF-8"))
+    (.write baos bs 0 (alength bs))
+    baos))
+
+(defn- baos-write-int! ^ByteArrayOutputStream [^ByteArrayOutputStream baos ^long n]
+  (.write baos (.getBytes (str "i" n "e") "UTF-8"))
+  baos)
+
+(defn- baos-write-dict! ^ByteArrayOutputStream [^ByteArrayOutputStream baos m])
+
+(defn- baos-write-val! ^ByteArrayOutputStream [^ByteArrayOutputStream baos v]
+  (cond
+    (integer? v) (baos-write-int! baos (long v))
+    (string? v)  (baos-write-str! baos v)
+    (map? v)     (do (baos-write-dict! baos v) baos)
+    :else (throw (ex-info "Unsupported value in ext-handshake encoder" {:v v :type (type v)}))))
+
+(defn- baos-write-dict! ^ByteArrayOutputStream [^ByteArrayOutputStream baos m]
+  (.write baos (int \d))
+  (doseq [k (sort (map str (keys m)))]
+    (baos-write-str! baos k)
+    (baos-write-val! baos (get m k)))
+  (.write baos (int \e))
+  baos)
+
+(defn send-ext-handshake!
+  "Отправляет extended handshake (ext-id=0), объявляя поддержку ut_pex."
+  [^DataOutputStream out ^long port]
+  (let [baos (ByteArrayOutputStream.)
+        _ (baos-write-dict! baos {"m" {"ut_pex" 1}
+                                  "p" (long port)
+                                  "v" "mini-torrent"})
+        data (.toByteArray baos)]
+    (send-extended! out 0 data)))
+
+(defn parse-ext-handshake
+  "data (bencoded dict) -> {:ut-pex-id <int|nil> :dict <map>}"
+  [^bytes data]
+  (let [[m _] (ben/decode* data 0)
+        ut (get-in m ["m" "ut_pex"])]
+    {:ut-pex-id (when (number? ut) (long ut))
+     :dict m}))
+
+(defn- parse-compact-peers4
+  "compact IPv4: 6 bytes per peer."
+  [^bytes peers]
+  (when-not (zero? (mod (alength peers) 6))
+    [])
+  (vec
+   (for [i (range 0 (alength peers) 6)]
+     (let [a (bit-and (aget peers i) 0xff)
+           b (bit-and (aget peers (+ i 1)) 0xff)
+           c (bit-and (aget peers (+ i 2)) 0xff)
+           d (bit-and (aget peers (+ i 3)) 0xff)
+           p1 (bit-and (aget peers (+ i 4)) 0xff)
+           p2 (bit-and (aget peers (+ i 5)) 0xff)
+           port (+ (* p1 256) p2)]
+       {:ip (str a "." b "." c "." d)
+        :port port}))))
+
+(defn- parse-compact-peers6
+  "compact IPv6: 18 bytes per peer."
+  [^bytes peers6]
+  (when-not (zero? (mod (alength peers6) 18))
+    [])
+  (vec
+   (for [i (range 0 (alength peers6) 18)]
+     (let [addr (byte-array 16)
+           _ (System/arraycopy peers6 i addr 0 16)
+           p1 (bit-and (aget peers6 (+ i 16)) 0xff)
+           p2 (bit-and (aget peers6 (+ i 17)) 0xff)
+           port (+ (* p1 256) p2)
+           ip (.getHostAddress (InetAddress/getByAddress addr))]
+       {:ip ip :port port}))))
+
+(defn parse-ut-pex
+  "data (bencoded dict) -> {:added [peers...] :raw <dict>}.
+   Используем в основном :added."
+  [^bytes data]
+  (let [[m _] (ben/decode* data 0)
+        added  (get m "added")
+        added6 (get m "added6")
+        peers4 (if (bx/byte-array? added)  (parse-compact-peers4 added)  [])
+        peers6 (if (bx/byte-array? added6) (parse-compact-peers6 added6) [])]
+    {:added (vec (concat peers4 peers6))
+     :raw m}))
