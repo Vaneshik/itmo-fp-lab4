@@ -111,7 +111,7 @@
     (logln)))
 
 (defn- valid-port? [p]
-  (and (number? p) (<= 1 (long p) 65535)))
+  (and (number? p) (<= 1024 (long p) 65535)))
 
 (defn- inet6-ula? [^InetAddress a]
   ;; Unique Local Address: fc00::/7 (fc.. or fd..)
@@ -269,7 +269,7 @@
   [{:keys [peer torrent peer-id stats queue done peers-pool port in-flight]}]
   (let [current-piece (atom nil)]
     (try
-      (with-open [sock (pw/connect peer 8000 60000)
+      (with-open [sock (pw/connect peer 3000 20000)
                   in  (java.io.DataInputStream. (java.io.BufferedInputStream. (.getInputStream sock)))
                   out (java.io.DataOutputStream. (java.io.BufferedOutputStream. (.getOutputStream sock)))
                   raf (RandomAccessFile. (File. (:out-path stats)) "rw")]
