@@ -1,8 +1,0 @@
-/.cpcache
-/.clj-kondo/.cache
-/.lsp
-/target
-/.shadow-cljs
-/node_modules
-/resources/public/js
-/resources/public/css
