@@ -1,15 +1,9 @@
 (ns mini-torrent.torrent
-  (:require [mini-torrent.bencode :as ben])
+  (:require [mini-torrent.bencode :as ben]
+            [mini-torrent.bytes :as bx])
   (:import [java.io File]
            [java.nio.file Files]
-           [java.security MessageDigest]
            [java.nio.charset StandardCharsets]))
-
-(defn sha1 ^bytes [^bytes bs]
-  (.digest (MessageDigest/getInstance "SHA-1") bs))
-
-(defn bytes->hex [^bytes bs]
-  (apply str (map #(format "%02x" (bit-and % 0xff)) bs)))
 
 (defn- bstr->utf8 [^bytes b]
   (String. b StandardCharsets/UTF_8))
@@ -19,14 +13,15 @@
   [torrent-path]
   (let [bs (Files/readAllBytes (.toPath (File. torrent-path)))
         {:keys [meta info-bytes]} (ben/decode-torrent bs)
-        info-hash (sha1 info-bytes)
+        info-hash (bx/sha1 info-bytes)
         announce  (some-> (get meta "announce") bstr->utf8)
         info      (get meta "info")
         name      (some-> (get info "name") bstr->utf8)
         piece-length (long (get info "piece length"))
         length    (long (get info "length"))
-        pieces-bytes ^bytes (get info "pieces")]
-    (when-not (and announce name piece-length length pieces-bytes)
+        pieces-bytes (get info "pieces")]
+
+    (when-not (and announce info name piece-length length pieces-bytes)
       (throw (ex-info "Missing required fields" {:have (keys info)})))
 
     (when-not (zero? (mod (alength pieces-bytes) 20))
@@ -43,6 +38,7 @@
        :name name
        :piece-length piece-length
        :length length
+       :pieces-count n
        :piece-hashes piece-hashes
        :info-hash info-hash
-       :info-hash-hex (bytes->hex info-hash)})))
+       :info-hash-hex (bx/bytes->hex info-hash)})))

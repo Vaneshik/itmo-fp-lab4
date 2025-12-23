@@ -2,7 +2,8 @@
   (:gen-class)
   (:require [mini-torrent.torrent :as tor]
             [mini-torrent.tracker :as tr]
-            [mini-torrent.peer :as pw])
+            [mini-torrent.peer :as pw]
+            [mini-torrent.bytes :as bx])
   (:import [java.io RandomAccessFile File]
            [java.util Arrays]))
 
@@ -25,7 +26,9 @@
   [total piece-length idx pieces-count]
   (let [start (* (long idx) (long piece-length))
         remain (- (long total) start)]
-    (long (min (long piece-length) remain))))
+    (if (= idx (dec pieces-count))
+      remain
+      (long piece-length))))
 
 (defn ensure-file!
   [out-path total-len]
@@ -43,9 +46,10 @@
     (.seek raf offset)
     (.write raf block 0 (alength block))))
 
-(defn read-piece-bytes
+(defn- read-piece-bytes
+  "Read piece idx from file."
   [^RandomAccessFile raf piece-idx piece-length plen]
-  (let [buf (byte-array (int plen))]
+  (let [buf (byte-array plen)]
     (.seek raf (* (long piece-idx) (long piece-length)))
     (.readFully raf buf)
     buf))
@@ -64,6 +68,14 @@
                              (vec (concat (subvec vv 0 i) (subvec vv (inc i))))))
               p)
             (recur (inc i))))))))
+
+(defn verify-piece?
+  [torrent ^RandomAccessFile raf piece-idx]
+  (let [plen (piece-len (:length torrent) (:piece-length torrent) piece-idx (:pieces-count torrent))
+        piece-bytes (read-piece-bytes raf piece-idx (:piece-length torrent) plen)
+        got (bx/sha1 piece-bytes)
+        expected (nth (:piece-hashes torrent) piece-idx)]
+    (Arrays/equals got expected)))
 
 (defn start-stats-printer!
   [stats total-len pieces-total done]
@@ -142,9 +154,7 @@
       (throw (ex-info "Bad piece length" {:piece piece-idx :plen plen})))
 
     (let [next-send (atom 0)
-          pending   (atom (into #{} (map first blocks)))
-          ;; timeouts считаем, но сбрасываем при прогрессе
-          ]
+          pending   (atom (into #{} (map first blocks)))]
 
       (letfn [(send-next! []
                 (when (< @next-send total)
@@ -194,8 +204,7 @@
                           (write-block! raf piece-idx (:piece-length torrent) b block)
                           (swap! (:downloaded stats) + (alength ^bytes block))
                           (swap! pending disj b)
-                          ;; keep pipeline full
-                          (send-next!)
+                          (send-next!) ;; keep pipeline full
                           (recur (dec remaining) 0))
                         (recur remaining timeouts)))
 
@@ -206,7 +215,7 @@
 
         ;; verify sha1
         (let [piece-bytes (read-piece-bytes raf piece-idx (:piece-length torrent) plen)
-              got (pw/sha1 piece-bytes)
+              got (bx/sha1 piece-bytes)
               expected (nth (:piece-hashes torrent) piece-idx)]
           (Arrays/equals ^bytes got ^bytes expected))))))
 
@@ -250,7 +259,6 @@
 
                   timeout
                   (do
-                    ;; тик: если готовы — можно начать качать
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
                       (when-let [piece-idx (pick-piece! queue have)]
                         (reset! current-piece piece-idx)
@@ -261,7 +269,7 @@
                               (swap! queue conj piece-idx)))
                           (catch clojure.lang.ExceptionInfo ex
                             (if (= (:reason (ex-data ex)) :choked)
-                              (swap! queue conj piece-idx) ; просто вернём кусок, соединение оставим
+                              (swap! queue conj piece-idx)
                               (throw ex)))
                           (finally
                             (reset! current-piece nil)))))
@@ -277,7 +285,6 @@
                   (do
                     (handle-msg! state id payload)
 
-                    ;; после обработки сообщений — если готовы, берём piece
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
                       (when-let [piece-idx (pick-piece! queue have)]
                         (reset! current-piece piece-idx)
@@ -299,11 +306,9 @@
                     (recur))))))))
 
       (catch Exception e
-        ;; вернуть кусок в очередь
         (when-let [p @current-piece]
           (swap! queue conj p))
 
-        ;; учесть фейл (но баним только после 3)
         (let [n (peer-fail! stats peer)]
           (when (>= n 3)
             (println "\n[worker] peer marked bad:" (peer-key peer) "(fails:" n ")")))
@@ -342,7 +347,7 @@
                                        :downloaded @(:downloaded stats)
                                        :left       (max 0 (- (:length torrent) @(:downloaded stats)))
                                        :numwant    120
-                                       :event      (when (compare-and-set! started? false true) "started")})
+                                       :event      (when (compare-and-set! started? false true) :started)})
                     interval (long (max 30 (or (:interval resp) 120)))
                     peers (:peers resp)
                     peers2 (->> peers
@@ -408,9 +413,6 @@
       (println "size    :" (:length t) "bytes")
       (println "pieces  :" pieces-total)
       (println "infohash:" (:info-hash-hex t))
-      (println "webseeds:" 0)
-      (println "piece-hashes type:" (class (:piece-hashes t)))
-      (println "first hash type:" (class (first (:piece-hashes t))))
 
       (start-stats-printer! stats (:length t) pieces-total done)
 

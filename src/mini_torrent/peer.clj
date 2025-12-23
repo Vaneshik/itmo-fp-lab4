@@ -1,13 +1,6 @@
 (ns mini-torrent.peer
-  (:import [java.net Socket InetSocketAddress]
-           [java.io DataInputStream DataOutputStream]
-           [java.security MessageDigest]))
-
-(defn sha1 ^bytes [^bytes bs]
-  (.digest (MessageDigest/getInstance "SHA-1") bs))
-
-(defn bytes->hex [^bytes bs]
-  (apply str (map #(format "%02x" (bit-and (int %) 0xff)) bs)))
+  (:import [java.net Socket InetSocketAddress SocketTimeoutException]
+           [java.io DataInputStream DataOutputStream EOFException]))
 
 (defn- write-int! [^DataOutputStream out ^long v]
   (.writeInt out (int v)))
@@ -20,8 +13,47 @@
     (.readFully in buf)
     buf))
 
+(defn- u8 ^long [b]
+  (long (bit-and (int b) 0xff)))
+
+(defn- aset-int32-be!
+  "Записать int32 big-endian в byte-array."
+  [^bytes out ^long off ^long v]
+  (let [x (long v)]
+    (aset-byte out (int off)       (unchecked-byte (bit-and (bit-shift-right x 24) 0xff)))
+    (aset-byte out (int (inc off)) (unchecked-byte (bit-and (bit-shift-right x 16) 0xff)))
+    (aset-byte out (int (+ off 2)) (unchecked-byte (bit-and (bit-shift-right x 8) 0xff)))
+    (aset-byte out (int (+ off 3)) (unchecked-byte (bit-and x 0xff))))
+  out)
+
+(defn- int32-be ^long [^bytes bs ^long off]
+  (let [b0 (u8 (aget bs (int off)))
+        b1 (u8 (aget bs (int (inc off))))
+        b2 (u8 (aget bs (int (+ off 2))))
+        b3 (u8 (aget bs (int (+ off 3))))]
+    (long (bit-or (bit-shift-left b0 24)
+                  (bit-shift-left b1 16)
+                  (bit-shift-left b2 8)
+                  b3))))
+
+(defn msg-type
+  "Преобразует numeric msg id в keyword."
+  [^long id]
+  (case (long id)
+    0 :choke
+    1 :unchoke
+    2 :interested
+    3 :not-interested
+    4 :have
+    5 :bitfield
+    6 :request
+    7 :piece
+    8 :cancel
+    :unknown))
+
 (defn connect
-  "connect-timeout-ms: TCP connect timeout
+  "peer = {:ip \"1.2.3.4\" :port 6881}
+   connect-timeout-ms: connect timeout
    read-timeout-ms: SO_TIMEOUT for reads"
   ([peer connect-timeout-ms]
    (connect peer connect-timeout-ms 60000))
@@ -36,7 +68,7 @@
   [^DataOutputStream out ^bytes info-hash ^bytes peer-id]
   (.writeByte out 19)
   (.write out (.getBytes "BitTorrent protocol"))
-  (.write out (byte-array 8))
+  (.write out (byte-array 8)) ;; reserved
   (.write out info-hash)
   (.write out peer-id)
   (.flush out))
@@ -45,13 +77,13 @@
   [^DataInputStream in]
   (let [pstrlen (.readUnsignedByte in)
         pstr (String. (read-n! in pstrlen))
-        reserved (read-n! in 8)
+        _reserved (read-n! in 8)
         info-hash (read-n! in 20)
         peer-id (read-n! in 20)]
-    {:pstr pstr :reserved reserved :info-hash info-hash :peer-id peer-id}))
+    {:pstr pstr :info-hash info-hash :peer-id peer-id}))
 
 (defn send-msg!
-  "length-prefix (4) + id (1) + payload"
+  "Отправляет message: <len:4><id:1><payload:len-1>."
   [^DataOutputStream out ^long id ^bytes payload]
   (let [len (+ 1 (alength payload))]
     (write-int! out len)
@@ -60,80 +92,70 @@
       (.write out payload))
     (.flush out)))
 
+(defn send-keepalive! [^DataOutputStream out]
+  (write-int! out 0)
+  (.flush out))
+
 (defn read-msg!
-  "Returns one of:
-   - {:timeout true}
-   - {:eof true}
-   - {:keep-alive true}
-   - {:id <int> :payload <bytes>}"
+  "Читает length-prefixed сообщение.
+   Возвращает одну из форм:
+   {:timeout true}
+   {:eof true}
+   {:keep-alive true}
+   {:id <long> :payload <bytes>}  ;; payload включает первый байт id."
   [^DataInputStream in]
   (try
     (let [len (read-int! in)]
-      (if (zero? len)
-        {:keep-alive true}
-        (let [id (.readUnsignedByte in)
-              payload (read-n! in (dec len))]
+      (cond
+        (zero? len) {:keep-alive true}
+        :else
+        (let [payload (read-n! in len)
+              id (u8 (aget payload 0))]
           {:id id :payload payload})))
-    (catch java.net.SocketTimeoutException _
+    (catch SocketTimeoutException _
       {:timeout true})
-    (catch java.io.EOFException _
+    (catch EOFException _
       {:eof true})))
 
-(defn msg-type [id]
-  (case id
-    0 :choke
-    1 :unchoke
-    2 :interested
-    3 :not-interested
-    4 :have
-    5 :bitfield
-    6 :request
-    7 :piece
-    8 :cancel
-    :unknown))
+;; --- payload builders/parsers used by core ---------------------------------
 
-(defn- u8 ^long [b] (long (bit-and (int b) 0xff)))
+(defn build-request-payload
+  "Payload для request (id=6): <index:4><begin:4><length:4>."
+  [^long index ^long begin ^long length]
+  (doto (byte-array 12)
+    (aset-int32-be! 0 index)
+    (aset-int32-be! 4 begin)
+    (aset-int32-be! 8 length)))
 
-(defn- int32-be ^long [^bytes bs ^long off]
-  (let [b0 (u8 (aget bs off))
-        b1 (u8 (aget bs (+ off 1)))
-        b2 (u8 (aget bs (+ off 2)))
-        b3 (u8 (aget bs (+ off 3)))]
-    (+ (bit-shift-left b0 24)
-       (bit-shift-left b1 16)
-       (bit-shift-left b2 8)
-       b3)))
-
-(defn parse-have-index ^long [^bytes payload]
-  (int32-be payload 0))
-
-(defn parse-bitfield
-  "bitfield payload -> boolean-array pieces-count"
-  [^bytes payload pieces-count]
-  (let [out (boolean-array pieces-count)]
-    (dotimes [i pieces-count]
-      (let [byte-idx (quot i 8)
-            bit-idx  (- 7 (mod i 8))]
-        (when (< byte-idx (alength payload))
-          (let [b (u8 (aget payload byte-idx))]
-            (aset-boolean out i (not (zero? (bit-and b (bit-shift-left 1 bit-idx)))))))))
-    out))
-
-(defn build-request-payload ^bytes [^long piece-idx ^long begin ^long length]
-  (let [p (byte-array 12)]
-    (doseq [[off v] [[0 piece-idx] [4 begin] [8 length]]]
-      (aset-byte p (+ off 0) (unchecked-byte (bit-and (bit-shift-right v 24) 0xff)))
-      (aset-byte p (+ off 1) (unchecked-byte (bit-and (bit-shift-right v 16) 0xff)))
-      (aset-byte p (+ off 2) (unchecked-byte (bit-and (bit-shift-right v 8) 0xff)))
-      (aset-byte p (+ off 3) (unchecked-byte (bit-and v 0xff))))
-    p))
+(defn parse-have-index
+  "payload (включая id в payload[0]) -> index."
+  [^bytes payload]
+  (int32-be payload 1))
 
 (defn parse-piece
-  "payload: <index 4><begin 4><block ...>"
+  "payload (включая id в payload[0]) -> {:index .. :begin .. :block byte[]}."
   [^bytes payload]
-  (let [idx   (int32-be payload 0)
-        begin (int32-be payload 4)
-        block-len (- (alength payload) 8)
-        block (byte-array block-len)]
-    (System/arraycopy payload 8 block 0 block-len)
+  (let [idx (int32-be payload 1)
+        begin (int32-be payload 5)
+        block-len (- (alength payload) 9)
+        block (byte-array (max 0 block-len))]
+    (when (pos? block-len)
+      (System/arraycopy payload 9 block 0 block-len))
     {:index idx :begin begin :block block}))
+
+(defn parse-bitfield
+  "payload (включая id) -> boolean-array длины pieces-count."
+  [^bytes payload pieces-count]
+  (let [bf-len (dec (alength payload))
+        bf (byte-array (max 0 bf-len))]
+    (when (pos? bf-len)
+      (System/arraycopy payload 1 bf 0 bf-len))
+    (let [have (boolean-array pieces-count)]
+      (dotimes [i pieces-count]
+        (let [byte-idx (quot i 8)
+              bit-idx (- 7 (mod i 8))]
+          (when (< byte-idx bf-len)
+            (aset-boolean have i
+                          (pos? (bit-and (u8 (aget bf byte-idx))
+                                         (bit-shift-left 1 bit-idx)))))))
+      have)))
