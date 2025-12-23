@@ -14,7 +14,7 @@
 (defn- bstr->utf8 [^bytes b]
   (String. b StandardCharsets/UTF_8))
 
-(defn load-torrent
+(defn parse-torrent
   "Single-file torrent v1. pieces = byte-string of 20-byte SHA1 hashes."
   [torrent-path]
   (let [bs (Files/readAllBytes (.toPath (File. torrent-path)))
