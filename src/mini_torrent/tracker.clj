@@ -257,6 +257,15 @@
         rb (doto (ByteBuffer/wrap resp) (.order ByteOrder/BIG_ENDIAN))
         action (.getInt rb)
         rtx (.getInt rb)]
+    (when (= action 3)
+      ;; BEP-15: action=3 -> error, затем идёт UTF-8 строка сообщения
+      (let [n (- (alength resp) 8)
+            msg (byte-array (max 0 n))]
+        (when (pos? n)
+          (.get rb msg))
+        (throw (ex-info "UDP tracker error"
+                        {:announce announce
+                         :message (String. ^bytes msg StandardCharsets/UTF_8)}))))
     (when-not (= action 1)
       (throw (ex-info "UDP tracker: bad announce action" {:action action :announce announce})))
     (when-not (= rtx tx)
