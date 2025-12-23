@@ -553,7 +553,7 @@
 
       (peer-manager! {:torrent t :peer-id peer-id :port port
                       :stats stats :queue queue :done done}
-                     30)
+                     100)
 
       (while (not @done)
         (Thread/sleep 200))
