@@ -11,8 +11,15 @@
          metosin/reitit-middleware {:mvn/version "0.7.2"}
 
          ;; JSON/content negotiation
-         metosin/muuntaja {:mvn/version "0.6.10"}}
+         metosin/muuntaja {:mvn/version "0.6.10"}
+
+         org.clojure/tools.logging {:mvn/version "1.3.0"}
+         ch.qos.logback/logback-classic {:mvn/version "1.5.16"}}
 
  :aliases
  {:run {:main-opts ["-m" "mini-torrent.server"]}
-  :dev {:extra-paths ["dev" "test"]}}}
+
+  :dev {:extra-paths ["dev" "test"]}
+
+  :test {:extra-paths ["test"]
+         :main-opts ["-m" "runner"]}}}

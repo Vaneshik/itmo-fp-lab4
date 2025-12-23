@@ -1,23 +1,12 @@
 (ns mini-torrent.tracker
   (:require [mini-torrent.bencode :as ben]
-            [mini-torrent.bytes :as bx])
+            [mini-torrent.bytes :as bx]
+            [clojure.tools.logging :as log])
   (:import [java.net URL URI HttpURLConnection InetAddress DatagramSocket DatagramPacket]
            [java.io ByteArrayOutputStream]
            [java.util Random]
            [java.nio ByteBuffer ByteOrder]
            [java.nio.charset StandardCharsets]))
-
-(def ^:dynamic *quiet* true)
-
-(def ^:private log-lock (Object.))
-
-(defn- logln
-  "Thread-safe println (чтобы вывод из разных future не склеивался)."
-  [& xs]
-  (locking log-lock
-    (when-not *quiet*
-      (apply println xs)
-      (flush))))
 
 (defn- read-all-bytes ^bytes [^java.io.InputStream in]
   (with-open [in in
@@ -165,7 +154,7 @@
                           (bx/byte-array? peers6) (parse-compact-peers6 peers6)
                           :else (throw (ex-info "Unsupported peers6 format" {:type (type peers6) :url url})))
             all-peers (vec (concat peers4-list peers6-list))]
-        (logln (format "[tracker] parsed peers: ipv4=%d ipv6=%d total=%d interval=%ds"
+        (log/debug (format "[tracker] parsed peers: ipv4=%d ipv6=%d total=%d interval=%ds"
                          (count peers4-list) (count peers6-list) (count all-peers) interval))
         {:interval interval :peers all-peers}))))
 
@@ -286,7 +275,7 @@
           peers-bytes (byte-array (- (alength resp) 20))]
       (.get rb peers-bytes)
       (let [peers (parse-compact-peers peers-bytes)]
-        (logln (format "[tracker] parsed peers: ipv4=%d ipv6=%d total=%d interval=%ds"
+        (log/debug (format "[tracker] parsed peers: ipv4=%d ipv6=%d total=%d interval=%ds"
                          (count peers) 0 (count peers) interval))
         {:interval interval :peers peers}))))
 

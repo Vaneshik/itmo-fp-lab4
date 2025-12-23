@@ -3,7 +3,8 @@
   (:require [mini-torrent.torrent :as tor]
             [mini-torrent.tracker :as tr]
             [mini-torrent.peer :as pw]
-            [mini-torrent.bytes :as bx])
+            [mini-torrent.bytes :as bx]
+            [clojure.tools.logging :as log])
   (:import [java.io RandomAccessFile File]
            [java.util Arrays]
            [java.net InetAddress Inet6Address]))
@@ -13,25 +14,6 @@
 
 (def ^:private peers-pool-cap 5000)
 (def ^:private pex-batch-cap 200)
-
-(def ^:private log-lock (Object.))
-
-(def ^:dynamic *quiet* true)
-
-(defn- logln
-  "Thread-safe println (чтобы вывод из разных future не склеивался)."
-  [& xs]
-  (locking log-lock
-    (when-not *quiet*
-      (apply println xs)
-      (flush))))
-
-(defn- logp
-  "Thread-safe printflush (для progress-строки)."
-  [^String s]
-  (locking log-lock
-    (print s)
-    (flush)))
 
 (defn- control-state
   "Возвращает :running/:paused/:stopped. Если control не передали — считаем :running."
@@ -116,12 +98,10 @@
               dt (/ (- t prev-t) 1000.0)
               speed (if (pos? dt) (/ (- b prev-bytes) dt) 0.0)
               pct (* 100.0 (/ (double @(:pieces-done stats)) (double pieces-total)))]
-          (logp (format "\r%6.2f%% | peers:%2d | %s / %s | %s/s"
-                        pct @(:peers-active stats)
-                        (fmt-bytes b) (fmt-bytes total-len)
-                        (fmt-bytes speed)))
-          (recur b t))))
-    (logln)))
+          (log/info "Downloaded" pct "|" (fmt-bytes b) "/" (fmt-bytes total-len) "bytes"
+                    "peers" @(:peers-active stats)
+                    "speed" (fmt-bytes speed) "B/s")
+          (recur b t))))))
 
 (defn- valid-port? [p]
   (and (number? p) (<= 1024 (long p) 65535)))
@@ -443,12 +423,12 @@
           (swap! queue conj p))
 
         (if (= (:reason (ex-data e)) :stopped)
-          (logln (format "[worker] stopped: %s" (peer-key peer)))
+          (log/debug (format "[worker] stopped: %s" (peer-key peer)))
           (do
             (let [n (peer-fail! stats peer)]
               (when (>= n 3)
-                (logln (format "[worker] peer marked bad: %s (fails: %d)" (peer-key peer) n))))
-            (logln (format "[worker] peer failed: %s | ex: %s | msg: %s"
+                (log/debug (format "[worker] peer marked bad: %s (fails: %d)" (peer-key peer) n))))
+            (log/debug (format "[worker] peer failed: %s | ex: %s | msg: %s"
                            (peer-key peer)
                            (.getName (class e))
                            (or (.getMessage e) "nil"))))))
@@ -513,7 +493,7 @@
                                                           :numwant    400
                                                           :event      event*})}
                                      (catch Exception e
-                                       (logln (str "[tracker] failed: " url " | " (.getMessage e)
+                                       (log/debug (str "[tracker] failed: " url " | " (.getMessage e)
                                                    (when (ex-data e) (str " | data=" (pr-str (ex-data e))))))
                                        {:url url :ok false :err e})))
                                  trackers)
@@ -534,16 +514,16 @@
                         (reset! next-announce-ms (+ now (* interval 1000)))
 
                         (let [pool-before (count @peers-pool)]
-                          (logln (format
+                          (log/debug (format
                                   "[tracker] trackers=%d ok=%d raw=%d fresh=%d pool(before)=%d active=%d interval=%ds"
                                   (count trackers) (count good) (count peers) (count peers2)
                                   pool-before @(:peers-active stats) interval)))
 
                         (when (seq peers2)
                           (add-peers-to-pool! peers-pool stats in-flight peers2))
-                        (logln (format "[tracker] pool(after)=%d" (count @peers-pool))))
+                        (log/debug (format "[tracker] pool(after)=%d" (count @peers-pool))))
                       (catch Exception e
-                        (logln "\n[tracker] announce failed:" (.getMessage e)
+                        (log/debug "\n[tracker] announce failed:" (.getMessage e)
                                (when (ex-data e) (str " | data=" (pr-str (ex-data e)))))
                         (reset! next-announce-ms (+ now 15000))))))
 
@@ -558,7 +538,7 @@
                                (not (contains? @in-flight p)))
                       (swap! in-flight conj p)
                       (swap! (:peers-active stats) inc)
-                      (logln (format "[manager] starting worker for %s (running=%d active=%d pool=%d)"
+                      (log/debug (format "[manager] starting worker for %s (running=%d active=%d pool=%d)"
                                      (peer-key p) (count @in-flight) @(:peers-active stats) (count @peers-pool)))
                       (future
                         (try
@@ -571,7 +551,7 @@
                           (finally
                             (swap! in-flight disj p)
                             (swap! (:peers-active stats) (fn [x] (max 0 (dec x))))
-                            (logln (format "[manager] worker finished for %s (running=%d active=%d)"
+                            (log/debug (format "[manager] worker finished for %s (running=%d active=%d)"
                                            (peer-key p) (count @in-flight) @(:peers-active stats)))))))))
 
                 (Thread/sleep 200)))))

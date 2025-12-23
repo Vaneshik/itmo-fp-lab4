@@ -5,6 +5,7 @@
    [clojure.java.io :as io]
    [mini-torrent.http-api :as api]
    [ring.adapter.jetty :as jetty]
+   [clojure.tools.logging :as log]
    [ring.middleware.not-modified :refer [wrap-not-modified]]
    [ring.middleware.resource :refer [wrap-resource]]))
 
@@ -45,7 +46,7 @@
              (jetty/run-jetty (handler {:cors? cors? :serve-static? serve-static?})
                               {:port port
                                :join? false}))
-     (println (str "HTTP server started on http://localhost:" port))
+     (log/info (str "HTTP server started on http://localhost:" port))
      @server*)))
 
 (defn stop! []
