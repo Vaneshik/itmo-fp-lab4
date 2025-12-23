@@ -301,9 +301,23 @@
           (Arrays/equals ^bytes got ^bytes expected))))))
 
 (defn worker!
-  [{:keys [peer torrent peer-id stats queue done peers-pool port in-flight control]}]
-  (let [current-piece (atom nil)]
+  [{:keys [peer torrent peer-id stats queue done peers-pool port in-flight control peers]}]
+  (let [current-piece (atom nil)
+        k (peer-key peer)
+        touch! (fn []
+                 (when peers
+                   (swap! peers update k (fn [m]
+                                           (assoc (or m {})
+                                                  :lastSeenMs (now-ms))))))]
     (try
+      ;; регистрируем peer в реестре (если включён)
+      (when peers
+        (swap! peers assoc k {:peer k
+                              :ip (:ip peer)
+                              :port (:port peer)
+                              :startedAtMs (now-ms)
+                              :lastSeenMs (now-ms)}))
+
       (with-open [sock (pw/connect peer 3000 20000)
                   in  (java.io.DataInputStream. (java.io.BufferedInputStream. (.getInputStream sock)))
                   out (java.io.DataOutputStream. (java.io.BufferedOutputStream. (.getOutputStream sock)))
@@ -340,20 +354,21 @@
                   (cond
                     (= ext-id 0)
                     (let [{id :ut-pex-id} (pw/parse-ext-handshake data)]
-                      (when id
-                        (reset! ut-pex-id id)))
+                      (when id (reset! ut-pex-id id)))
 
                     (and @ut-pex-id (= ext-id @ut-pex-id))
                     (let [{:keys [added]} (pw/parse-ut-pex data)]
                       (when (seq added)
-                        ;; кидаем найденных пиров в общий пул
                         (add-peers-to-pool! peers-pool stats in-flight added)))
 
                     :else nil)))]
 
           (loop []
             (when-not @done
-              ;; stop => выходим аккуратно (и ре-queue текущего куска сделает общий catch)
+              ;; периодически трогаем lastSeen
+              (touch!)
+
+              ;; stop => выходим аккуратно
               (when (= :stopped (control-state control))
                 (reset! done true)
                 (throw (ex-info "Stopped" {:reason :stopped})))
@@ -365,8 +380,8 @@
 
                   timeout
                   (do
+                    (touch!)
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
-                      ;; paused => просто не начинаем новый кусок
                       (when (= :running (control-state control))
                         (when-let [piece-idx (pick-piece! queue have)]
                           (reset! current-piece piece-idx)
@@ -388,13 +403,15 @@
                     (recur))
 
                   keep-alive
-                  (recur)
+                  (do (touch!) (recur))
 
                   (nil? id)
-                  (recur)
+                  (do (touch!) (recur))
 
                   :else
                   (do
+                    (touch!)
+
                     (when (= (pw/msg-type id) :extended)
                       (handle-extended! payload))
 
@@ -434,11 +451,17 @@
             (logln (format "[worker] peer failed: %s | ex: %s | msg: %s"
                            (peer-key peer)
                            (.getName (class e))
-                           (or (.getMessage e) "nil")))))))))
+                           (or (.getMessage e) "nil"))))))
+
+      (finally
+        ;; снимаем peer из реестра активных
+        (when peers
+          (swap! peers dissoc k))))))
+
 
 (defn peer-manager!
   "Держит target активных воркеров."
-  [{:keys [torrent peer-id port stats queue done control]} target]
+  [{:keys [torrent peer-id port stats queue done control peers]} target]
   (let [peers-pool (atom [])
         started?   (atom false)
         in-flight  (atom #{})
@@ -543,7 +566,8 @@
                                     :stats stats :queue queue :done done
                                     :peers-pool peers-pool :port port
                                     :in-flight in-flight
-                                    :control control})
+                                    :control control
+                                    :peers peers})
                           (finally
                             (swap! in-flight disj p)
                             (swap! (:peers-active stats) (fn [x] (max 0 (dec x))))

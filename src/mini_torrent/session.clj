@@ -35,9 +35,9 @@
 
 (defn- state->status [state done?]
   (cond
+    (= state :stopped) :stopped
     done? :completed
     (= state :paused) :paused
-    (= state :stopped) :stopped
     :else :running))
 
 (defn- session-status [session]
@@ -96,14 +96,11 @@
      :infoHashHex    (:info-hash-hex (:torrent session))
      :outPath        (-> stats :out-path)}))
 
-(defn session->peers
-  "Пока в ядре нет полноценного реестра текущих peers с метриками,
-   поэтому возвращаем минимум. Позже расширим, когда добавим tracking активных соединений."
-  [session]
-  (let [stats (:stats session)]
-    {:id          (:id session)
-     :peersActive (long @(-> stats :peers-active))
-     :peerFails   (into {} @(-> stats :peer-fails))}))
+(defn session->peers [session]
+  {:id (:id session)
+   :peersActive (count @(-> session :peers))
+   :peers (->> @(-> session :peers) vals (sort-by :startedAtMs) vec)
+   :peerFails (into {} @(-> session :stats :peer-fails))})
 
 ;; -------------------------
 ;; Control
@@ -174,7 +171,8 @@
   (when-not torrent-path
     (throw (ex-info "torrent-path is required" {})))
 
-  (let [t (tor/parse-torrent torrent-path)
+  (let [peers (atom {})  ;; peer-key -> {:ip :port :startedAtMs ...}
+        t (tor/parse-torrent torrent-path)
         peer-id (or peer-id (tr/random-peer-id))
         id (new-id)
         pieces-total (count (:piece-hashes t))
@@ -205,6 +203,7 @@
 
                  :peer-id peer-id
                  :port port
+                 :peers peers
 
                  :stats stats
                  :queue queue
@@ -225,7 +224,8 @@
                          :stats stats
                          :queue queue
                          :done done
-                         :control control}
+                         :control control
+                         :peers peers}
                         target-peers)
 
     session))
