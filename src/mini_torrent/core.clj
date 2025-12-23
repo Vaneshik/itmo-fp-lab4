@@ -225,12 +225,11 @@
   [{:keys [peer torrent peer-id stats queue done peers-pool port]}]
   (let [current-piece (atom nil)]
     (try
+      (swap! (:peers-active stats) inc)
       (with-open [sock (pw/connect peer 8000 60000)
                   in  (java.io.DataInputStream. (java.io.BufferedInputStream. (.getInputStream sock)))
                   out (java.io.DataOutputStream. (java.io.BufferedOutputStream. (.getOutputStream sock)))
                   raf (RandomAccessFile. (File. (:out-path stats)) "rw")]
-
-        (swap! (:peers-active stats) inc)
 
         ;; handshake
         (pw/send-handshake! out (:info-hash torrent) peer-id)
@@ -358,9 +357,9 @@
     (future
       (while (not @done)
         (let [now (now-ms)
-              active @(:peers-active stats)
+              running (count @in-flight)
               pool-empty? (empty? @peers-pool)
-              early? (and (= active 0) pool-empty? (>= (- now @last-announce-ms) 15000))
+              early? (and (= running 0) pool-empty? (>= (- now @last-announce-ms) 15000))
               due? (>= now @next-announce-ms)]
 
           (when (and pool-empty? (or due? early?))
@@ -424,15 +423,15 @@
 
         ;; запускаем воркеры
         (while (and (not @done)
-                    (< @(:peers-active stats) target)
+                    (< (count @in-flight) target)
                     (seq @peers-pool))
           (let [p (first @peers-pool)]
             (swap! peers-pool subvec 1)
             (when (and (not (peer-bad? stats p))
                        (not (contains? @in-flight p)))
               (swap! in-flight conj p)
-              (println (format "[manager] starting worker for %s (active=%d pool=%d)"
-                               (peer-key p) @(:peers-active stats) (count @peers-pool)))
+              (println (format "[manager] starting worker for %s (running=%d active=%d pool=%d)"
+                               (peer-key p) (count @in-flight) @(:peers-active stats) (count @peers-pool)))
               (future
                 (try
                   (worker! {:peer p :torrent torrent :peer-id peer-id
@@ -440,8 +439,8 @@
                             :peers-pool peers-pool :port port})
                   (finally
                     (swap! in-flight disj p)
-                    (println (format "[manager] worker finished for %s (active=%d)"
-                                     (peer-key p) @(:peers-active stats)))))))))
+                    (println (format "[manager] worker finished for %s (running=%d active=%d)"
+                                     (peer-key p) (count @in-flight) @(:peers-active stats)))))))))
 
         (Thread/sleep 200)))))
 
