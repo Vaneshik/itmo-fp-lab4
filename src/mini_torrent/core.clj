@@ -33,6 +33,13 @@
     (print s)
     (flush)))
 
+(defn- control-state
+  "Возвращает :running/:paused/:stopped. Если control не передали — считаем :running."
+  [control]
+  (try
+    (or (get @control :state) :running)
+    (catch Exception _ :running)))
+
 (defn now-ms [] (System/currentTimeMillis))
 
 (defn fmt-bytes [n]
@@ -294,7 +301,7 @@
           (Arrays/equals ^bytes got ^bytes expected))))))
 
 (defn worker!
-  [{:keys [peer torrent peer-id stats queue done peers-pool port in-flight]}]
+  [{:keys [peer torrent peer-id stats queue done peers-pool port in-flight control]}]
   (let [current-piece (atom nil)]
     (try
       (with-open [sock (pw/connect peer 3000 20000)
@@ -346,6 +353,11 @@
 
           (loop []
             (when-not @done
+              ;; stop => выходим аккуратно (и ре-queue текущего куска сделает общий catch)
+              (when (= :stopped (control-state control))
+                (reset! done true)
+                (throw (ex-info "Stopped" {:reason :stopped})))
+
               (let [{:keys [timeout eof keep-alive id payload]} (pw/read-msg! in)]
                 (cond
                   eof
@@ -354,19 +366,25 @@
                   timeout
                   (do
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
-                      (when-let [piece-idx (pick-piece! queue have)]
-                        (reset! current-piece piece-idx)
-                        (try
-                          (let [ok? (download-piece-pipelined! raf in out stats torrent state handle-extended! piece-idx)]
-                            (if ok?
-                              (swap! (:pieces-done stats) inc)
-                              (swap! queue conj piece-idx)))
-                          (catch clojure.lang.ExceptionInfo ex
-                            (if (= (:reason (ex-data ex)) :choked)
-                              (swap! queue conj piece-idx)
-                              (throw ex)))
-                          (finally
-                            (reset! current-piece nil)))))
+                      ;; paused => просто не начинаем новый кусок
+                      (when (= :running (control-state control))
+                        (when-let [piece-idx (pick-piece! queue have)]
+                          (reset! current-piece piece-idx)
+                          (try
+                            (let [ok? (download-piece-pipelined! raf in out stats torrent state handle-extended! piece-idx)]
+                              (if ok?
+                                (swap! (:pieces-done stats) inc)
+                                (swap! queue conj piece-idx)))
+                            (catch clojure.lang.ExceptionInfo ex
+                              (if (= (:reason (ex-data ex)) :choked)
+                                (swap! queue conj piece-idx)
+                                (throw ex)))
+                            (finally
+                              (reset! current-piece nil)))
+
+                          (when (= @(:pieces-done stats) pieces-count)
+                            (reset! done true)))))
+
                     (recur))
 
                   keep-alive
@@ -383,22 +401,23 @@
                     (handle-msg! state id payload)
 
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
-                      (when-let [piece-idx (pick-piece! queue have)]
-                        (reset! current-piece piece-idx)
-                        (try
-                          (let [ok? (download-piece-pipelined! raf in out stats torrent state handle-extended! piece-idx)]
-                            (if ok?
-                              (swap! (:pieces-done stats) inc)
-                              (swap! queue conj piece-idx)))
-                          (catch clojure.lang.ExceptionInfo ex
-                            (if (= (:reason (ex-data ex)) :choked)
-                              (swap! queue conj piece-idx)
-                              (throw ex)))
-                          (finally
-                            (reset! current-piece nil)))))
+                      (when (= :running (control-state control))
+                        (when-let [piece-idx (pick-piece! queue have)]
+                          (reset! current-piece piece-idx)
+                          (try
+                            (let [ok? (download-piece-pipelined! raf in out stats torrent state handle-extended! piece-idx)]
+                              (if ok?
+                                (swap! (:pieces-done stats) inc)
+                                (swap! queue conj piece-idx)))
+                            (catch clojure.lang.ExceptionInfo ex
+                              (if (= (:reason (ex-data ex)) :choked)
+                                (swap! queue conj piece-idx)
+                                (throw ex)))
+                            (finally
+                              (reset! current-piece nil)))
 
-                    (when (= @(:pieces-done stats) pieces-count)
-                      (reset! done true))
+                          (when (= @(:pieces-done stats) pieces-count)
+                            (reset! done true)))))
 
                     (recur))))))))
 
@@ -406,117 +425,133 @@
         (when-let [p @current-piece]
           (swap! queue conj p))
 
-        (let [n (peer-fail! stats peer)]
-          (when (>= n 3)
-            (logln (format "[worker] peer marked bad: %s (fails: %d)" (peer-key peer) n))))
-
-        (logln (format "[worker] peer failed: %s | ex: %s | msg: %s"
-                       (peer-key peer)
-                       (.getName (class e))
-                       (or (.getMessage e) "nil")))))))
+        (if (= (:reason (ex-data e)) :stopped)
+          (logln (format "[worker] stopped: %s" (peer-key peer)))
+          (do
+            (let [n (peer-fail! stats peer)]
+              (when (>= n 3)
+                (logln (format "[worker] peer marked bad: %s (fails: %d)" (peer-key peer) n))))
+            (logln (format "[worker] peer failed: %s | ex: %s | msg: %s"
+                           (peer-key peer)
+                           (.getName (class e))
+                           (or (.getMessage e) "nil")))))))))
 
 (defn peer-manager!
   "Держит target активных воркеров."
-  [{:keys [torrent peer-id port stats queue done]} target]
+  [{:keys [torrent peer-id port stats queue done control]} target]
   (let [peers-pool (atom [])
         started?   (atom false)
         in-flight  (atom #{})
         last-announce-ms (atom 0)
         next-announce-ms (atom 0)]
     (future
-      (while (not @done)
-        (let [now (now-ms)
-              running (count @in-flight)
-              pool-empty? (empty? @peers-pool)
-              early? (and (= running 0) pool-empty? (>= (- now @last-announce-ms) 15000))
-              due? (>= now @next-announce-ms)]
+      (loop []
+        (while (not @done)
+          (let [st (control-state control)]
+            (cond
+              (= st :stopped)
+              (reset! done true)
 
-          (when (and pool-empty? (or due? early?))
-            (try
-              (let [extra-trackers
-                    ["udp://tracker.opentrackr.org:1337/announce"
-                     "udp://open.stealth.si:80/announce"
-                     "udp://open.demonii.com:1337/announce"
-                     "udp://tracker.torrent.eu.org:451/announce"
-                     "udp://tracker.dler.org:6969/announce"]
-                    trackers (vec (distinct (concat (or (:announce-list torrent) [(:announce torrent)])
-                                                    extra-trackers)))
-                    event* (when (compare-and-set! started? false true) :started)
+              (= st :paused)
+              (Thread/sleep 200)
 
-                    results
-                    (map (fn [url]
-                           (try
-                             {:url url :ok true
-                              :resp (tr/announce {:announce   url
-                                                  :info-hash  (:info-hash torrent)
-                                                  :peer-id    peer-id
-                                                  :port       port
-                                                  :uploaded   0
-                                                  :downloaded @(:downloaded stats)
-                                                  :left       (max 0 (- (:length torrent) @(:downloaded stats)))
-                                                  :numwant    400
-                                                  :event      event*})}
-                             (catch Exception e
-                               (logln (str "[tracker] failed: " url " | " (.getMessage e)
-                                           (when (ex-data e) (str " | data=" (pr-str (ex-data e))))))
-                               {:url url :ok false :err e})))
-                         trackers)
+              :else
+              (do
 
-                    good (filter :ok results)
-                    peers (->> good (mapcat (comp :peers :resp)) vec)
-                    interval (long (max 30 (or (some->> good (map (comp :interval :resp)) (remove nil?) (apply min))
-                                               120)))
+                (let [now (now-ms)
+                      running (count @in-flight)
+                      pool-empty? (empty? @peers-pool)
+                      early? (and (= running 0) pool-empty? (>= (- now @last-announce-ms) 15000))
+                      due? (>= now @next-announce-ms)]
 
-                    peers2 (->> peers
-                                (filter good-peer?)
-                                (remove #(peer-bad? stats %))
-                                (remove @in-flight)
-                                distinct
-                                vec)]
+                  (when (and pool-empty? (or due? early?))
+                    (try
+                      (let [extra-trackers
+                            ["udp://tracker.opentrackr.org:1337/announce"
+                             "udp://open.stealth.si:80/announce"
+                             "udp://open.demonii.com:1337/announce"
+                             "udp://tracker.torrent.eu.org:451/announce"
+                             "udp://tracker.dler.org:6969/announce"]
+                            trackers (vec (distinct (concat (or (:announce-list torrent) [(:announce torrent)])
+                                                            extra-trackers)))
+                            event* (when (compare-and-set! started? false true) :started)
 
-                (reset! last-announce-ms now)
-                (reset! next-announce-ms (+ now (* interval 1000)))
+                            results
+                            (map (fn [url]
+                                   (try
+                                     {:url url :ok true
+                                      :resp (tr/announce {:announce   url
+                                                          :info-hash  (:info-hash torrent)
+                                                          :peer-id    peer-id
+                                                          :port       port
+                                                          :uploaded   0
+                                                          :downloaded @(:downloaded stats)
+                                                          :left       (max 0 (- (:length torrent) @(:downloaded stats)))
+                                                          :numwant    400
+                                                          :event      event*})}
+                                     (catch Exception e
+                                       (logln (str "[tracker] failed: " url " | " (.getMessage e)
+                                                   (when (ex-data e) (str " | data=" (pr-str (ex-data e))))))
+                                       {:url url :ok false :err e})))
+                                 trackers)
 
-                (let [pool-before (count @peers-pool)]
-                  (logln (format
-                          "[tracker] trackers=%d ok=%d raw=%d fresh=%d pool(before)=%d active=%d interval=%ds"
-                          (count trackers) (count good) (count peers) (count peers2)
-                          pool-before @(:peers-active stats) interval)))
+                            good (filter :ok results)
+                            peers (->> good (mapcat (comp :peers :resp)) vec)
+                            interval (long (max 30 (or (some->> good (map (comp :interval :resp)) (remove nil?) (apply min))
+                                                       120)))
 
-                (when (seq peers2)
-                  (add-peers-to-pool! peers-pool stats in-flight peers2))
-                (logln (format "[tracker] pool(after)=%d" (count @peers-pool))))
-              (catch Exception e
-                (logln "\n[tracker] announce failed:" (.getMessage e)
-                       (when (ex-data e) (str " | data=" (pr-str (ex-data e)))))
-                (reset! next-announce-ms (+ now 15000))))))
+                            peers2 (->> peers
+                                        (filter good-peer?)
+                                        (remove #(peer-bad? stats %))
+                                        (remove @in-flight)
+                                        distinct
+                                        vec)]
 
-        ;; запускаем воркеры
-        (while (and (not @done)
-                    (< (count @in-flight) target)
-                    (seq @peers-pool))
-          (let [p (first @peers-pool)]
-            (swap! peers-pool subvec 1)
-            (when (and (good-peer? p)
-                       (not (peer-bad? stats p))
-                       (not (contains? @in-flight p)))
-              (swap! in-flight conj p)
-              (swap! (:peers-active stats) inc)
-              (logln (format "[manager] starting worker for %s (running=%d active=%d pool=%d)"
-                             (peer-key p) (count @in-flight) @(:peers-active stats) (count @peers-pool)))
-              (future
-                (try
-                  (worker! {:peer p :torrent torrent :peer-id peer-id
-                            :stats stats :queue queue :done done
-                            :peers-pool peers-pool :port port
-                            :in-flight in-flight})
-                  (finally
-                    (swap! in-flight disj p)
-                    (swap! (:peers-active stats) (fn [x] (max 0 (dec x))))
-                    (logln (format "[manager] worker finished for %s (running=%d active=%d)"
-                                   (peer-key p) (count @in-flight) @(:peers-active stats)))))))))
+                        (reset! last-announce-ms now)
+                        (reset! next-announce-ms (+ now (* interval 1000)))
 
-        (Thread/sleep 200)))))
+                        (let [pool-before (count @peers-pool)]
+                          (logln (format
+                                  "[tracker] trackers=%d ok=%d raw=%d fresh=%d pool(before)=%d active=%d interval=%ds"
+                                  (count trackers) (count good) (count peers) (count peers2)
+                                  pool-before @(:peers-active stats) interval)))
+
+                        (when (seq peers2)
+                          (add-peers-to-pool! peers-pool stats in-flight peers2))
+                        (logln (format "[tracker] pool(after)=%d" (count @peers-pool))))
+                      (catch Exception e
+                        (logln "\n[tracker] announce failed:" (.getMessage e)
+                               (when (ex-data e) (str " | data=" (pr-str (ex-data e)))))
+                        (reset! next-announce-ms (+ now 15000))))))
+
+                ;; запускаем воркеры
+                (while (and (not @done)
+                            (< (count @in-flight) target)
+                            (seq @peers-pool))
+                  (let [p (first @peers-pool)]
+                    (swap! peers-pool subvec 1)
+                    (when (and (good-peer? p)
+                               (not (peer-bad? stats p))
+                               (not (contains? @in-flight p)))
+                      (swap! in-flight conj p)
+                      (swap! (:peers-active stats) inc)
+                      (logln (format "[manager] starting worker for %s (running=%d active=%d pool=%d)"
+                                     (peer-key p) (count @in-flight) @(:peers-active stats) (count @peers-pool)))
+                      (future
+                        (try
+                          (worker! {:peer p :torrent torrent :peer-id peer-id
+                                    :stats stats :queue queue :done done
+                                    :peers-pool peers-pool :port port
+                                    :in-flight in-flight
+                                    :control control})
+                          (finally
+                            (swap! in-flight disj p)
+                            (swap! (:peers-active stats) (fn [x] (max 0 (dec x))))
+                            (logln (format "[manager] worker finished for %s (running=%d active=%d)"
+                                           (peer-key p) (count @in-flight) @(:peers-active stats)))))))))
+
+                (Thread/sleep 200)))))
+        (recur)))))
 
 (defn -main [& args]
   (let [[torrent-path out-dir] args

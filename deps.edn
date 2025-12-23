@@ -1,2 +1,18 @@
-{:paths ["src"]
- :deps  {org.clojure/clojure {:mvn/version "1.11.3"}}}
+{:paths ["src" "resources"]
+ :deps  {org.clojure/clojure {:mvn/version "1.11.3"}
+
+         ;; HTTP stack
+         ring/ring-core {:mvn/version "1.12.2"}
+         ring/ring-jetty-adapter {:mvn/version "1.12.2"}
+
+         ;; Router
+         metosin/reitit-ring {:mvn/version "0.7.2"}
+         ;; Reitit middlewares (в т.ч. reitit.ring.middleware.muuntaja)
+         metosin/reitit-middleware {:mvn/version "0.7.2"}
+
+         ;; JSON/content negotiation
+         metosin/muuntaja {:mvn/version "0.6.10"}}
+
+ :aliases
+ {:run {:main-opts ["-m" "mini-torrent.server"]}
+  :dev {:extra-paths ["dev" "test"]}}}
