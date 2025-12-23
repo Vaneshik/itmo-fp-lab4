@@ -11,14 +11,20 @@
 (def block-size 16384)
 (def pipeline-depth 12)
 
+(def ^:private peers-pool-cap 5000)
+(def ^:private pex-batch-cap 200)
+
 (def ^:private log-lock (Object.))
+
+(def ^:dynamic *quiet* true)
 
 (defn- logln
   "Thread-safe println (чтобы вывод из разных future не склеивался)."
   [& xs]
   (locking log-lock
-    (apply println xs)
-    (flush)))
+    (when-not *quiet*
+      (apply println xs)
+      (flush))))
 
 (defn- logp
   "Thread-safe printflush (для progress-строки)."
@@ -153,6 +159,28 @@
   (let [k (peer-key peer)
         n (get @(:peer-fails stats) k 0)]
     (>= n 3)))
+
+(defn- add-peers-to-pool!
+  "Добавляет peers в peers-pool:
+   - фильтрует мусор
+   - убирает bad и in-flight
+   - дедуп
+   - капает общий пул и одну порцию"
+  [peers-pool stats in-flight peers]
+  (let [fresh (->> peers
+                   (filter good-peer?)
+                   (remove #(peer-bad? stats %))
+                   (remove @in-flight)
+                   distinct
+                   (take pex-batch-cap)
+                   vec)]
+    (when (seq fresh)
+      (swap! peers-pool
+             (fn [v]
+               (->> (concat v fresh)
+                    distinct
+                    (take peers-pool-cap)
+                    vec))))))
 
 (defn- handle-msg!
   "Updates have/choked state for common messages."
@@ -312,14 +340,7 @@
                     (let [{:keys [added]} (pw/parse-ut-pex data)]
                       (when (seq added)
                         ;; кидаем найденных пиров в общий пул
-                        (let [added2 (->> added
-                                          (filter good-peer?)
-                                          (remove #(peer-bad? stats %))
-                                          (remove @in-flight)
-                                          distinct
-                                          vec)]
-                          (when (seq added2)
-                            (swap! peers-pool into added2)))))
+                        (add-peers-to-pool! peers-pool stats in-flight added)))
 
                     :else nil)))]
 
@@ -463,7 +484,7 @@
                           pool-before @(:peers-active stats) interval)))
 
                 (when (seq peers2)
-                  (swap! peers-pool into peers2))
+                  (add-peers-to-pool! peers-pool stats in-flight peers2))
                 (logln (format "[tracker] pool(after)=%d" (count @peers-pool))))
               (catch Exception e
                 (logln "\n[tracker] announce failed:" (.getMessage e)
