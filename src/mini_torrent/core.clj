@@ -8,6 +8,9 @@
 
 (def block-size 16384)
 
+;; сколько request'ов держим "в полёте" на один piece
+(def pipeline-depth 12)
+
 (defn now-ms [] (System/currentTimeMillis))
 
 (defn fmt-bytes [n]
@@ -115,74 +118,97 @@
               (reset! have-known? true)))
     nil))
 
-(defn- wait-for-block!
-  "Wait until we receive :piece for (piece-idx, expected-begin).
-   While waiting, handle choke/unchoke/have/bitfield.
-   Returns block bytes."
-  [in state piece-idx expected-begin expected-len]
-  (loop [timeouts 0]
-    (let [{:keys [timeout eof keep-alive id payload]} (pw/read-msg! in)]
-      (cond
-        eof
-        (throw (ex-info "Peer disconnected" {}))
+(defn- blocks-for-piece
+  "Returns vector of [begin len] blocks for a piece length plen."
+  [^long plen]
+  (loop [begin 0 acc []]
+    (if (>= begin plen)
+      acc
+      (let [l (long (min block-size (- plen begin)))]
+        (recur (+ begin l) (conj acc [begin l]))))))
 
-        timeout
-        (if (>= timeouts 4)
-          (throw (ex-info "Too many timeouts waiting block" {:piece piece-idx :begin expected-begin}))
-          (recur (inc timeouts)))
-
-        keep-alive
-        (recur timeouts)
-
-        (nil? id)
-        (recur timeouts)
-
-        :else
-        (let [t (pw/msg-type id)]
-          (cond
-            (= t :choke)
-            (do
-              (handle-msg! state id payload)
-              (throw (ex-info "Choked mid-piece" {:piece piece-idx})))
-
-            (= t :piece)
-            (let [{idx :index b :begin block :block} (pw/parse-piece payload)]
-              (if (and (= idx piece-idx) (= b expected-begin))
-                (do
-                  (when-not (= (alength ^bytes block) expected-len)
-                    (throw (ex-info "Bad block length" {:got (alength ^bytes block)
-                                                        :expected expected-len
-                                                        :piece piece-idx
-                                                        :begin expected-begin})))
-                  block)
-                (recur timeouts)))
-
-            :else
-            (do
-              (handle-msg! state id payload)
-              (recur timeouts))))))))
-
-(defn- download-piece!
-  "Download one piece from this peer. Returns true if piece verified OK."
+(defn- download-piece-pipelined!
+  "Download piece using request pipelining.
+   Returns true if verified OK.
+   May throw ExceptionInfo with {:reason :choked} to signal 'not fatal, just retry later'."
   [^RandomAccessFile raf in out stats torrent state piece-idx]
   (let [pieces-count (:pieces-count state)
-        plen (piece-len (:length torrent) (:piece-length torrent) piece-idx pieces-count)]
-    (loop [begin0 0]
-      (when (< begin0 plen)
-        (let [expected-begin begin0
-              expected-len   (min block-size (- plen begin0))
-              req-payload    (pw/build-request-payload piece-idx expected-begin expected-len)]
-          (pw/send-msg! out 6 req-payload)
-          (let [block (wait-for-block! in state piece-idx expected-begin expected-len)]
-            (write-block! raf piece-idx (:piece-length torrent) expected-begin block)
-            (swap! (:downloaded stats) + (alength ^bytes block)))
-          (recur (+ begin0 expected-len)))))
+        plen (piece-len (:length torrent) (:piece-length torrent) piece-idx pieces-count)
+        blocks (blocks-for-piece plen)
+        total (count blocks)
+        len-by-begin (into {} blocks)]
 
-    ;; sha1 verify
-    (let [piece-bytes (read-piece-bytes raf piece-idx (:piece-length torrent) plen)
-          got (pw/sha1 piece-bytes)
-          expected (nth (:piece-hashes torrent) piece-idx)]
-      (Arrays/equals ^bytes got ^bytes expected))))
+    (when (zero? total)
+      (throw (ex-info "Bad piece length" {:piece piece-idx :plen plen})))
+
+    (let [next-send (atom 0)
+          pending   (atom (into #{} (map first blocks)))
+          ;; timeouts считаем, но сбрасываем при прогрессе
+          ]
+
+      (letfn [(send-next! []
+                (when (< @next-send total)
+                  (let [[b l] (nth blocks @next-send)]
+                    (pw/send-msg! out 6 (pw/build-request-payload piece-idx b l))
+                    (swap! next-send inc)
+                    true)))]
+        ;; initial fill
+        (dotimes [_ (min pipeline-depth total)]
+          (send-next!))
+
+        ;; receive loop
+        (loop [remaining total timeouts 0]
+          (when (pos? remaining)
+            (let [{:keys [timeout eof keep-alive id payload]} (pw/read-msg! in)]
+              (cond
+                eof
+                (throw (ex-info "Peer disconnected" {}))
+
+                timeout
+                (if (>= timeouts 6)
+                  (throw (ex-info "Too many timeouts waiting piece blocks" {:piece piece-idx}))
+                  (recur remaining (inc timeouts)))
+
+                keep-alive
+                (recur remaining timeouts)
+
+                (nil? id)
+                (recur remaining timeouts)
+
+                :else
+                (let [t (pw/msg-type id)]
+                  (cond
+                    (= t :choke)
+                    (do
+                      (handle-msg! state id payload)
+                      (throw (ex-info "Choked mid-piece" {:reason :choked :piece piece-idx})))
+
+                    (= t :piece)
+                    (let [{idx :index b :begin block :block} (pw/parse-piece payload)]
+                      (if (and (= idx piece-idx) (contains? @pending b))
+                        (let [expected-len (long (get len-by-begin b -1))]
+                          (when-not (= expected-len (alength ^bytes block))
+                            (throw (ex-info "Bad block length"
+                                            {:piece piece-idx :begin b
+                                             :got (alength ^bytes block) :expected expected-len})))
+                          (write-block! raf piece-idx (:piece-length torrent) b block)
+                          (swap! (:downloaded stats) + (alength ^bytes block))
+                          (swap! pending disj b)
+                          ;; keep pipeline full
+                          (send-next!)
+                          (recur (dec remaining) 0))
+                        (recur remaining timeouts)))
+
+                    :else
+                    (do
+                      (handle-msg! state id payload)
+                      (recur remaining timeouts))))))))
+
+        ;; verify sha1
+        (let [piece-bytes (read-piece-bytes raf piece-idx (:piece-length torrent) plen)
+              got (pw/sha1 piece-bytes)
+              expected (nth (:piece-hashes torrent) piece-idx)]
+          (Arrays/equals ^bytes got ^bytes expected))))))
 
 (defn worker!
   [{:keys [peer torrent peer-id stats queue done]}]
@@ -218,22 +244,27 @@
           (loop []
             (when-not @done
               (let [{:keys [timeout eof keep-alive id payload]} (pw/read-msg! in)]
-
                 (cond
                   eof
                   (throw (ex-info "Peer disconnected" {}))
 
-                  ;; timeout = "тик": можно попытаться начать скачивать, даже если нет сообщений
                   timeout
                   (do
+                    ;; тик: если готовы — можно начать качать
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
                       (when-let [piece-idx (pick-piece! queue have)]
                         (reset! current-piece piece-idx)
-                        (let [ok? (download-piece! raf in out stats torrent state piece-idx)]
-                          (if ok?
-                            (swap! (:pieces-done stats) inc)
-                            (swap! queue conj piece-idx))
-                          (reset! current-piece nil))))
+                        (try
+                          (let [ok? (download-piece-pipelined! raf in out stats torrent state piece-idx)]
+                            (if ok?
+                              (swap! (:pieces-done stats) inc)
+                              (swap! queue conj piece-idx)))
+                          (catch clojure.lang.ExceptionInfo ex
+                            (if (= (:reason (ex-data ex)) :choked)
+                              (swap! queue conj piece-idx) ; просто вернём кусок, соединение оставим
+                              (throw ex)))
+                          (finally
+                            (reset! current-piece nil)))))
                     (recur))
 
                   keep-alive
@@ -250,11 +281,17 @@
                     (when (and (not @choked?) @have-known? (nil? @current-piece))
                       (when-let [piece-idx (pick-piece! queue have)]
                         (reset! current-piece piece-idx)
-                        (let [ok? (download-piece! raf in out stats torrent state piece-idx)]
-                          (if ok?
-                            (swap! (:pieces-done stats) inc)
-                            (swap! queue conj piece-idx))
-                          (reset! current-piece nil))))
+                        (try
+                          (let [ok? (download-piece-pipelined! raf in out stats torrent state piece-idx)]
+                            (if ok?
+                              (swap! (:pieces-done stats) inc)
+                              (swap! queue conj piece-idx)))
+                          (catch clojure.lang.ExceptionInfo ex
+                            (if (= (:reason (ex-data ex)) :choked)
+                              (swap! queue conj piece-idx)
+                              (throw ex)))
+                          (finally
+                            (reset! current-piece nil)))))
 
                     (when (= @(:pieces-done stats) pieces-count)
                       (reset! done true))
@@ -286,8 +323,7 @@
         started?   (atom false)
         in-flight  (atom #{})
         last-announce-ms (atom 0)
-        next-announce-ms (atom 0)
-        last-interval-s  (atom 120)]
+        next-announce-ms (atom 0)]
     (future
       (while (not @done)
         (let [now (now-ms)
@@ -296,7 +332,6 @@
               early? (and (= active 0) pool-empty? (>= (- now @last-announce-ms) 15000))
               due? (>= now @next-announce-ms)]
 
-          ;; announce только когда надо
           (when (and pool-empty? (or due? early?))
             (try
               (let [resp (tr/announce {:announce   (:announce torrent)
@@ -306,17 +341,15 @@
                                        :uploaded   0
                                        :downloaded @(:downloaded stats)
                                        :left       (max 0 (- (:length torrent) @(:downloaded stats)))
-                                       :numwant    100
+                                       :numwant    120
                                        :event      (when (compare-and-set! started? false true) "started")})
                     interval (long (max 30 (or (:interval resp) 120)))
                     peers (:peers resp)
-                    ;; фильтруем только реально bad + уже в flight
                     peers2 (->> peers
                                 (remove #(peer-bad? stats %))
                                 (remove @in-flight)
                                 vec)]
                 (reset! last-announce-ms now)
-                (reset! last-interval-s interval)
                 (reset! next-announce-ms (+ now (* interval 1000)))
 
                 (println (format "\n[tracker] peers raw=%d fresh=%d interval=%ds"
@@ -324,10 +357,8 @@
 
                 (when (seq peers2)
                   (swap! peers-pool into peers2)))
-
               (catch Exception e
                 (println "\n[tracker] announce failed:" (.getMessage e))
-                ;; если трекер упал — пробуем снова через 15с
                 (reset! next-announce-ms (+ now 15000))))))
 
         ;; запускаем воркеры
@@ -377,15 +408,11 @@
       (println "size    :" (:length t) "bytes")
       (println "pieces  :" pieces-total)
       (println "infohash:" (:info-hash-hex t))
-      (println "webseeds:" (count (:webseeds t)))
+      (println "webseeds:" 0)
       (println "piece-hashes type:" (class (:piece-hashes t)))
       (println "first hash type:" (class (first (:piece-hashes t))))
 
       (start-stats-printer! stats (:length t) pieces-total done)
-
-      ;; webseed оставляем как fallback (если появится поддержка url-list в torrent.clj)
-      (when (seq (:webseeds t))
-        (println "[info] webseeds present, but this torrent parser may not fill them yet."))
 
       (peer-manager! {:torrent t :peer-id peer-id :port port
                       :stats stats :queue queue :done done}

@@ -6,6 +6,9 @@
 (defn sha1 ^bytes [^bytes bs]
   (.digest (MessageDigest/getInstance "SHA-1") bs))
 
+(defn bytes->hex [^bytes bs]
+  (apply str (map #(format "%02x" (bit-and (int %) 0xff)) bs)))
+
 (defn- write-int! [^DataOutputStream out ^long v]
   (.writeInt out (int v)))
 
@@ -18,9 +21,8 @@
     buf))
 
 (defn connect
-  "TCP connect to peer.
-   connect-timeout-ms: timeout for TCP connect.
-   read-timeout-ms: socket SO_TIMEOUT for reads (peer may be silent for a while; 60s is OK)."
+  "connect-timeout-ms: TCP connect timeout
+   read-timeout-ms: SO_TIMEOUT for reads"
   ([peer connect-timeout-ms]
    (connect peer connect-timeout-ms 60000))
   ([{:keys [ip port]} connect-timeout-ms read-timeout-ms]
@@ -32,10 +34,9 @@
 
 (defn send-handshake!
   [^DataOutputStream out ^bytes info-hash ^bytes peer-id]
-  ;; <pstrlen=19><pstr><reserved 8><info_hash 20><peer_id 20>
   (.writeByte out 19)
   (.write out (.getBytes "BitTorrent protocol"))
-  (.write out (byte-array 8)) ;; reserved
+  (.write out (byte-array 8))
   (.write out info-hash)
   (.write out peer-id)
   (.flush out))
@@ -55,12 +56,12 @@
   (let [len (+ 1 (alength payload))]
     (write-int! out len)
     (.writeByte out (int id))
-    (.write out payload)
+    (when (pos? (alength payload))
+      (.write out payload))
     (.flush out)))
 
 (defn read-msg!
-  "Reads one peer-wire message.
-   Returns one of:
+  "Returns one of:
    - {:timeout true}
    - {:eof true}
    - {:keep-alive true}
@@ -93,9 +94,7 @@
 
 (defn- u8 ^long [b] (long (bit-and (int b) 0xff)))
 
-(defn- int32-be
-  "Read signed int32 from byte[] at offset, return as long (0..2^32-1 for our usage)."
-  ^long [^bytes bs ^long off]
+(defn- int32-be ^long [^bytes bs ^long off]
   (let [b0 (u8 (aget bs off))
         b1 (u8 (aget bs (+ off 1)))
         b2 (u8 (aget bs (+ off 2)))
