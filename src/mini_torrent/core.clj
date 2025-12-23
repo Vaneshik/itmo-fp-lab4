@@ -1,7 +1,6 @@
 (ns mini-torrent.core
   (:gen-class)
   (:require [mini-torrent.torrent :as tor]
-            [mini-torrent.webseed :as ws]
             [mini-torrent.tracker :as tr]
             [mini-torrent.peer :as pw])
   (:import [java.io RandomAccessFile File]
