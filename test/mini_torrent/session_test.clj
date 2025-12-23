@@ -5,7 +5,8 @@
             [mini-torrent.session.dto :as dto]
             [mini-torrent.torrent :as tor]
             [mini-torrent.tracker :as tr]
-            [mini-torrent.core :as core]))
+            [mini-torrent.core :as core]
+            [mini-torrent.core.fs :as fs]))
 
 
 (defn- reset-registry! [] (reg/clear!))
@@ -31,7 +32,7 @@
     (with-redefs-fn
       {#'tor/parse-torrent (fn [_] (mk-torrent))
        #'tr/random-peer-id (fn [] (byte-array 20))
-       #'core/ensure-file! (fn [out-path _total] out-path)
+       #'fs/ensure-file! (fn [out-path _total] out-path)
        #'core/peer-manager! (fn [args target]
                               (reset! pm-called {:args args :target target})
                               nil)

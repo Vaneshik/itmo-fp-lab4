@@ -2,7 +2,9 @@
   (:require [mini-torrent.torrent :as tor]
             [mini-torrent.tracker :as tr]
             [mini-torrent.core :as core]
-            [mini-torrent.session.registry :as reg])
+            [mini-torrent.core.fs :as fs]
+            [mini-torrent.session.registry :as reg]
+            [mini-torrent.session.stats :as stats-log])
   (:import [java.io File]
            [java.util UUID]))
 
@@ -62,10 +64,11 @@
 ;; -------------------------
 
 (defn create-session!
-  [{:keys [torrent-path out-dir target-peers port peer-id]
+  [{:keys [torrent-path out-dir target-peers port peer-id stats-log?]
     :or   {out-dir "downloads"
            target-peers 100
-           port 6881}}]
+           port 6881
+           stats-log? true}}]
   (when-not torrent-path
     (throw (ex-info "torrent-path is required" {})))
 
@@ -77,7 +80,7 @@
 
         _ (.mkdirs (File. out-dir))
         out-path (str out-dir File/separator (:name t))
-        _ (core/ensure-file! out-path (:length t))
+        _ (fs/ensure-file! out-path (:length t))
 
         stats {:downloaded   (atom 0)
                :pieces-done  (atom 0)
@@ -111,6 +114,10 @@
 
     (reg/put-session! session)
     (start-speed-tracker! session)
+    (when stats-log?
+      (stats-log/start-stats-printer! (assoc session
+                                             :pieces-total pieces-total
+                                             :total-bytes (:length t))))
 
     (core/peer-manager! {:torrent t
                          :peer-id peer-id

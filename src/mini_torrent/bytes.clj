@@ -25,3 +25,12 @@
   "Печатает байты в hex (нижний регистр), удобно для логов."
   [^bytes bs]
   (apply str (map #(format "%02x" (ubyte %)) bs)))
+
+(defn fmt-bytes
+  [n]
+  (let [n (double (or n 0))]
+    (cond
+      (< n 1024) (format "%.0f" n)
+      (< n (* 1024 1024)) (format "%.1fKiB" (/ n 1024.0))
+      (< n (* 1024 1024 1024)) (format "%.1fMiB" (/ n 1048576.0))
+      :else (format "%.1fGiB" (/ n 1073741824.0)))))
