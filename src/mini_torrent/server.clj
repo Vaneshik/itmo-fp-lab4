@@ -14,7 +14,7 @@
 (defn- read-edn-file [path]
   (when-let [f (io/file path)]
     (when (.exists f)
-      (with-open [r (io/reader f)]
+      (with-open [r (java.io.PushbackReader. (io/reader f))]
         (edn/read {:eof nil} r)))))
 
 (defn load-config
