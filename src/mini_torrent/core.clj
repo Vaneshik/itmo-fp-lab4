@@ -269,7 +269,6 @@
   [{:keys [peer torrent peer-id stats queue done peers-pool port in-flight]}]
   (let [current-piece (atom nil)]
     (try
-      (swap! (:peers-active stats) inc)
       (with-open [sock (pw/connect peer 8000 60000)
                   in  (java.io.DataInputStream. (java.io.BufferedInputStream. (.getInputStream sock)))
                   out (java.io.DataOutputStream. (java.io.BufferedOutputStream. (.getOutputStream sock)))
@@ -480,6 +479,7 @@
             (when (and (good-peer? p)
                        (not (peer-bad? stats p))
                        (not (contains? @in-flight p)))
+              (swap! in-flight conj p)
               (swap! (:peers-active stats) inc)
               (logln (format "[manager] starting worker for %s (running=%d active=%d pool=%d)"
                              (peer-key p) (count @in-flight) @(:peers-active stats) (count @peers-pool)))
@@ -490,6 +490,7 @@
                             :peers-pool peers-pool :port port
                             :in-flight in-flight})
                   (finally
+                    (swap! in-flight disj p)
                     (swap! (:peers-active stats) (fn [x] (max 0 (dec x))))
                     (logln (format "[manager] worker finished for %s (running=%d active=%d)"
                                    (peer-key p) (count @in-flight) @(:peers-active stats)))))))))
