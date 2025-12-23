@@ -1,25 +1,19 @@
 (ns mini-torrent.session-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [mini-torrent.session :as session]
+            [mini-torrent.session.service :as sess]
+            [mini-torrent.session.registry :as reg]
+            [mini-torrent.session.dto :as dto]
             [mini-torrent.torrent :as tor]
             [mini-torrent.tracker :as tr]
-            [mini-torrent.core :as core])
-  (:import [java.util Arrays]))
+            [mini-torrent.core :as core]))
 
-(defn- sessions-atom ^clojure.lang.Atom []
-  ;; private defonce sessions*
-  (var-get (ns-resolve 'mini-torrent.session 'sessions*)))
 
-(defn- reset-registry! []
-  (reset! (sessions-atom) {}))
+(defn- reset-registry! [] (reg/clear!))
 
 (use-fixtures :each (fn [f] (reset-registry!) (f) (reset-registry!)))
 
-(defn- bytes= [^bytes a ^bytes b]
-  (Arrays/equals a b))
-
 (defn- stub-start-speed-var []
-  (ns-resolve 'mini-torrent.session 'start-speed-tracker!))
+  (ns-resolve 'mini-torrent.session.service 'start-speed-tracker!))
 
 (defn- mk-torrent []
   {:name "file.bin"
@@ -46,15 +40,15 @@
 
 (deftest create-session-requires-path
   (is (thrown? clojure.lang.ExceptionInfo
-               (session/create-session! {}))))
+               (sess/create-session! {}))))
 
 (deftest create-session-adds-to-registry-and-calls-core
   (with-session-stubs
     (fn [pm-called]
-      (let [s (session/create-session! {:torrent-path "/tmp/a.torrent"})]
+      (let [s (sess/create-session! {:torrent-path "/tmp/a.torrent"})]
         (testing "registry"
-          (is (= 1 (count (session/list-sessions))))
-          (is (= s (session/get-session (:id s)))))
+          (is (= 1 (count (sess/list-sessions))))
+          (is (= s (sess/get-session (:id s)))))
 
         (testing "defaults"
           (is (= "downloads" (:out-dir s)))
@@ -69,55 +63,55 @@
 (deftest control-pause-resume-stop-delete
   (with-session-stubs
     (fn [_]
-      (let [s (session/create-session! {:torrent-path "/tmp/a.torrent"})
+      (let [s (sess/create-session! {:torrent-path "/tmp/a.torrent"})
             id (:id s)]
         (testing "pause/resume"
-          (is (true? (session/pause! id)))
-          (is (= :paused (:status (session/session->details (session/get-session id)))))
-          (is (true? (session/resume! id)))
-          (is (= :running (:status (session/session->details (session/get-session id))))))
+          (is (true? (sess/pause! id)))
+          (is (= :paused (:status (dto/session->details (sess/get-session id)))))
+          (is (true? (sess/resume! id)))
+          (is (= :running (:status (dto/session->details (sess/get-session id))))))
 
         (testing "stop sets done"
-          (is (true? (session/stop! id)))
-          (is (true? @(-> (session/get-session id) :done)))
-          (is (= :stopped (:status (session/session->details (session/get-session id))))))
+          (is (true? (sess/stop! id)))
+          (is (true? @(-> (sess/get-session id) :done)))
+          (is (= :stopped (:status (dto/session->details (sess/get-session id))))))
 
         (testing "delete removes"
-          (is (true? (session/delete! id)))
-          (is (nil? (session/get-session id)))
-          (is (= 0 (count (session/list-sessions)))))))))
+          (is (true? (sess/delete! id)))
+          (is (nil? (sess/get-session id)))
+          (is (= 0 (count (sess/list-sessions)))))))))
 
 (deftest dto-progress-and-status
   (with-session-stubs
     (fn [_]
-      (let [s (session/create-session! {:torrent-path "/tmp/a.torrent"})
+      (let [s (sess/create-session! {:torrent-path "/tmp/a.torrent"})
             stats (:stats s)]
 
         (testing "progress by bytes when total-bytes > 0"
           (reset! (:downloaded stats) 25)
-          (is (= 0.25 (:progress (session/session->details s))))
+          (is (= 0.25 (:progress (dto/session->details s))))
           (reset! (:downloaded stats) 200)
-          (is (= 1.0 (:progress (session/session->details s)))))
+          (is (= 1.0 (:progress (dto/session->details s)))))
 
         (testing "progress fallback by pieces when total-bytes is 0/nil"
           (let [s2 (assoc s :total-bytes 0)]
             (reset! (:pieces-done stats) 1)
-            (is (= 0.5 (:progress (session/session->details s2))))))
+            (is (= 0.5 (:progress (dto/session->details s2))))))
 
         (testing "done overrides paused"
-          (session/pause! (:id s))
+          (sess/pause! (:id s))
           (reset! (:done s) true)
-          (is (= :completed (:status (session/session->details s)))))))))
+          (is (= :completed (:status (dto/session->details s)))))))))
 
 (deftest peers-dto-sorts-by-startedAtMs
   (with-session-stubs
     (fn [_]
-      (let [s (session/create-session! {:torrent-path "/tmp/a.torrent"})
+      (let [s (sess/create-session! {:torrent-path "/tmp/a.torrent"})
             peers (:peers s)]
         (reset! peers
                 {"a" {:ip "1.1.1.1" :port 1 :startedAtMs 20}
                  "b" {:ip "2.2.2.2" :port 2 :startedAtMs 10}})
-        (let [dto (session/session->peers s)]
+        (let [dto (dto/session->peers s)]
           (is (= 2 (:peersActive dto)))
           (is (= ["2.2.2.2" "1.1.1.1"]
                  (mapv :ip (:peers dto)))))))))

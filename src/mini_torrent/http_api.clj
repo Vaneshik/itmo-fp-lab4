@@ -1,7 +1,7 @@
 (ns mini-torrent.http-api
   (:require
-   [clojure.java.io :as io]
-   [mini-torrent.session :as session]
+   [mini-torrent.session.service :as sess]
+   [mini-torrent.session.dto :as dto]
    [muuntaja.core :as m]
    [reitit.ring :as ring]
    [reitit.ring.middleware.muuntaja :as muuntaja]
@@ -73,7 +73,7 @@
   (ok {:status "ok"}))
 
 (defn list-torrents-handler [_]
-  (ok (mapv session/session->summary (session/list-sessions))))
+  (ok (mapv dto/session->summary (sess/list-sessions))))
 
 (defn create-torrent-handler [req]
   (try
@@ -89,9 +89,9 @@
                          :else nil)]
       (if-not torrent-path
         (bad "Expected multipart field `file` or JSON {torrentPath, outDir}" {:got body})
-        (let [s (session/create-session! {:torrent-path torrent-path
-                                          :out-dir out-dir})
-              dto (session/session->summary s)]
+        (let [s (sess/create-session! {:torrent-path torrent-path
+                                       :out-dir out-dir})
+              dto (dto/session->summary s)]
           (created {:id (:id dto)
                     :name (:name dto)
                     :status (:status dto)}))))
@@ -104,39 +104,39 @@
 
 (defn details-handler [req]
   (let [id (get-in req [:path-params :id])
-        s (session/get-session id)]
+        s (sess/get-session id)]
     (if-not s
       (not-found "Session not found" {:id id})
-      (ok (session/session->details s)))))
+      (ok (dto/session->details s)))))
 
 (defn peers-handler [req]
   (let [id (get-in req [:path-params :id])
-        s (session/get-session id)]
+        s (sess/get-session id)]
     (if-not s
       (not-found "Session not found" {:id id})
-      (ok (session/session->peers s)))))
+      (ok (dto/session->peers s)))))
 
 (defn pause-handler [req]
   (let [id (get-in req [:path-params :id])]
-    (if-not (session/pause! id)
+    (if-not (sess/pause! id)
       (not-found "Session not found" {:id id})
-      (ok (session/session->details (session/get-session id))))))
+      (ok (dto/session->details (sess/get-session id))))))
 
 (defn resume-handler [req]
   (let [id (get-in req [:path-params :id])]
-    (if-not (session/resume! id)
+    (if-not (sess/resume! id)
       (not-found "Session not found" {:id id})
-      (ok (session/session->details (session/get-session id))))))
+      (ok (dto/session->details (sess/get-session id))))))
 
 (defn stop-handler [req]
   (let [id (get-in req [:path-params :id])]
-    (if-not (session/stop! id)
+    (if-not (sess/stop! id)
       (not-found "Session not found" {:id id})
-      (ok (session/session->details (session/get-session id))))))
+      (ok (dto/session->details (sess/get-session id))))))
 
 (defn delete-handler [req]
   (let [id (get-in req [:path-params :id])]
-    (if-not (session/delete! id)
+    (if-not (sess/delete! id)
       (not-found "Session not found" {:id id})
       (ok {:ok true :id id}))))
 
