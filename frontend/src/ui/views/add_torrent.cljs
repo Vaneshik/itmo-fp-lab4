@@ -79,7 +79,7 @@
            
            [:div {:class "mb-6"}
             [:label {:class "block text-sm font-medium text-gray-300 mb-2"}
-             "Output Directory (on server)"]
+             "Output Directory"]
             [:input {:type "text"
                      :value @out-dir
                      :on-change #(reset! out-dir (-> % .-target .-value))
@@ -88,20 +88,12 @@
             [:p {:class "text-xs text-gray-400 mt-2"}
              "Path relative to server working directory (e.g., " [:code {:class "text-purple-400"} "downloads"] 
              " or " [:code {:class "text-purple-400"} "/absolute/path"] ")"]
-            [:p {:class "text-xs text-yellow-500 mt-1"}
-             "⚠️ Files will be downloaded on the server, not your local machine"]
             (when (:out-dir @errors)
               [:p {:class "mt-2 text-sm text-red-400"} (:out-dir @errors)])]
            
            (when (:upload @errors)
              [:div {:class "bg-red-900 bg-opacity-20 border border-red-700 rounded-lg p-4 mb-6"}
               [:p {:class "text-red-400 text-sm"} (:upload @errors)]])
-           
-           [:div {:class "bg-purple-900 bg-opacity-20 border border-purple-700 rounded-lg p-4 mb-6"}
-            [:h3 {:class "text-purple-400 font-semibold mb-2"} "🦜 Clojure BitTorrent Client"]
-            [:p {:class "text-gray-300 text-sm"}
-             "Functional. Immutable. Elegant. This client is built with pure Clojure - "
-             "no mutations, only transformations!"]]
            
            [:div {:class "flex space-x-4"}
             [c/button {:type :primary

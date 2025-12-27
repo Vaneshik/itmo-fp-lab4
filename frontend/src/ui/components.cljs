@@ -57,31 +57,6 @@
       [button {:type :primary :on-click on-add-click}
        "➕ Add Torrent"])]])
 
-(defn icon-button
-  [{:keys [on-click title icon class]}]
-  [:button
-   {:class (str "p-2 rounded hover:bg-gray-700 transition-colors duration-200 " (or class ""))
-    :on-click on-click
-    :title title}
-   [:span {:class "text-lg"} icon]])
-
-(defn table
-  [{:keys [headers rows class]}]
-  (js/console.log "Table component - headers:" headers "rows count:" (count rows))
-  (js/console.log "Table rows:" rows)
-  [:div {:class (str "overflow-x-auto " (or class ""))}
-   [:table {:class "w-full"}
-    [:thead {:class "bg-gray-700 text-gray-300 text-sm uppercase"}
-     [:tr
-      (for [[idx header] (map-indexed vector headers)]
-        [:th {:key idx :class "px-4 py-3 text-left"} header])]]
-    [:tbody {:class "divide-y divide-gray-700"}
-     (doall (for [[idx row] (map-indexed vector rows)]
-              (do
-                (js/console.log "Rendering table row" idx ":" row)
-                [:tr {:key idx :class "hover:bg-gray-750 transition-colors duration-150"}
-                 row])))]]])
-
 (defn empty-state
   [{:keys [icon title message action]}]
   [:div {:class "flex flex-col items-center justify-center py-16 text-center"}
@@ -90,30 +65,4 @@
    [:p {:class "text-gray-500 mb-6"} message]
    (when action
      action)])
-
-(defn input-field
-  [{:keys [label value on-change placeholder type error class]}]
-  [:div {:class (str "mb-4 " (or class ""))}
-   (when label
-     [:label {:class "block text-sm font-medium text-gray-300 mb-2"} label])
-   [:input
-    {:type (or type "text")
-     :value value
-     :on-change #(on-change (-> % .-target .-value))
-     :placeholder placeholder
-     :class (str "w-full px-4 py-2 bg-gray-700 border rounded-lg text-gray-100 "
-                 "focus:outline-none focus:ring-2 focus:ring-blue-500 "
-                 (if error "border-red-500" "border-gray-600"))}]
-   (when error
-     [:p {:class "text-red-500 text-sm mt-1"} error])])
-
-(defn stats-card
-  [{:keys [label value icon class]}]
-  [:div {:class (str "bg-gray-700 rounded-lg p-4 " (or class ""))}
-   [:div {:class "flex items-center justify-between"}
-    [:div
-     [:p {:class "text-gray-400 text-sm"} label]
-     [:p {:class "text-2xl font-bold text-gray-100 mt-1"} value]]
-    (when icon
-      [:div {:class "text-3xl text-blue-500"} icon])]])
 
